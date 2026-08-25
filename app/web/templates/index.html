@@ -1,0 +1,1199 @@
+{% extends "base.html" %}
+{% block title %}智能股票分析助手{% endblock %}
+{% block content %}
+<div class="home-layout">
+    <!-- ====== 左侧：已分析过的股票 ====== -->
+    <aside id="cachedStocksSection" class="sidebar" style="display:none;">
+        <div class="sidebar-header">
+            <div class="sidebar-header-top">
+                <span class="sidebar-icon">&#128202;</span>
+                <span class="sidebar-title">已分析过的股票</span>
+                <span class="sidebar-count" id="cachedStocksCount"></span>
+            </div>
+            <div class="sidebar-search">
+                <input type="text" id="sidebarSearch" placeholder="搜索股票代码/名称..." oninput="filterSidebarStocks(this.value)">
+            </div>
+        </div>
+        <div class="sidebar-list" id="cachedStocksList">
+            <div class="sidebar-loading">加载中...</div>
+        </div>
+    </aside>
+
+    <!-- ====== 右侧：对话区 + 输入区 ====== -->
+    <div class="main-area">
+        <!-- 对话区 -->
+        <div id="chatContainer" class="chat-container">
+            <div class="chat-header">
+                <div class="chat-header-left">
+                    <span class="chat-header-icon">&#128172;</span>
+                    <span class="chat-header-title">对话记录</span>
+                    <span class="chat-stock-tag" id="chatStockTag" style="display:none;"></span>
+                </div>
+                <button class="btn-clear" onclick="clearHistory()" title="清空对话记录">清空记录</button>
+            </div>
+            <div class="chat-messages" id="chatMessages">
+                <div class="message system-message welcome-msg">
+                    <div class="message-avatar">AI</div>
+                    <div class="message-content">
+                        <strong>智能股票分析助手</strong>
+                        <p>你好！请输入股票代码、股票名称，或描述你的分析需求，我会一步步帮你完成分析。</p>
+                        <p class="example-text">例如：分析贵州茅台、查询 600519 行情、帮我选股</p>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- 输入区 -->
+        <div id="inputArea" class="input-area">
+            <div class="input-wrapper">
+                <textarea id="chatInput" rows="1" placeholder="输入股票代码、名称或分析需求..." autofocus></textarea>
+                <button id="sendBtn" class="btn-send" onclick="sendMessage()">
+                    <span class="btn-send-text">发送</span>
+                    <span class="btn-send-icon">&#10148;</span>
+                </button>
+            </div>
+            <p class="input-hint" id="inputHint">按 Enter 发送，Shift+Enter 换行</p>
+        </div>
+    </div>
+</div>
+{% endblock %}
+
+{% block extra_scripts %}
+<!-- ECharts 图表库（K线图） -->
+<script src="https://cdn.jsdelivr.net/npm/echarts@5.4.3/dist/echarts.min.js"></script>
+<script>
+// ===== 状态管理 =====
+var STATE = {
+    idle: "idle",
+    waiting_intent: "waiting_intent",
+    awaiting_input: "awaiting_input",
+    analyzing: "analyzing",
+    follow_up: "follow_up",
+    confirm_switch: "confirm_switch",
+};
+var currentState = STATE.idle;
+var pendingIntent = null;    // {intent_type, stock_code, stock_name, message}
+var currentStock = null;     // {code, name} 当前正在分析的股票上下文
+var pendingSwitch = null;    // {code, name} 等待用户确认切换的目标股票
+var llmRecords = [];         // 完整 LLM 记录（来自 full_logs 事件）
+var allLogs = [];            // 完整日志（来自 full_logs 事件）
+var isProcessing = false;
+
+// ===== DOM 引用 =====
+var chatMessages = document.getElementById('chatMessages');
+var chatInput = document.getElementById('chatInput');
+var sendBtn = document.getElementById('sendBtn');
+var inputHint = document.getElementById('inputHint');
+
+// ===== 工具函数 =====
+function escapeHtml(text) {
+    if (!text) return '';
+    var d = document.createElement('div');
+    d.textContent = text;
+    return d.innerHTML;
+}
+
+function markedToHtml(text) {
+    if (!text) return '';
+
+    // 先保护代码块（避免内部内容被转义）
+    var codeBlocks = [];
+    text = text.replace(/```(\w*)\n([\s\S]*?)```/g, function(_, lang, code) {
+        var idx = codeBlocks.length;
+        codeBlocks.push('<pre class="md-code-block"><code>' +
+            code.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;') + '</code></pre>');
+        return '\x00CODEBLOCK' + idx + '\x00';
+    });
+
+    // 行内代码
+    var inlineCodes = [];
+    text = text.replace(/`([^`]+)`/g, function(_, code) {
+        var idx = inlineCodes.length;
+        inlineCodes.push('<code class="md-inline-code">' + code.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;') + '</code>');
+        return '\x00INLINECODE' + idx + '\x00';
+    });
+
+    // 转义 HTML 特殊字符
+    text = text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+
+    // 表格
+    text = text.replace(/^\|(.+)\|\s*\n\|[-:\s|]+\|\s*\n((?:\|.+\|\s*\n?)*)/gm, function(_, header, body) {
+        var headers = header.split('|').map(function(c) { return c.trim(); });
+        var rows = body.trim().split('\n');
+        var html = '<table class="md-table"><thead><tr>';
+        headers.forEach(function(h) { html += '<th>' + h + '</th>'; });
+        html += '</tr></thead><tbody>';
+        rows.forEach(function(row) {
+            var cells = row.split('|').filter(function(c, i, arr) {
+                return i > 0 && i < arr.length - 1;
+            }).map(function(c) { return c.trim(); });
+            if (cells.length === 0) return;
+            html += '<tr>';
+            cells.forEach(function(c) { html += '<td>' + c + '</td>'; });
+            html += '</tr>';
+        });
+        html += '</tbody></table>';
+        return html;
+    });
+
+    // 标题
+    text = text.replace(/^######\s+(.+)$/gm, '<h6>$1</h6>');
+    text = text.replace(/^#####\s+(.+)$/gm, '<h5>$1</h5>');
+    text = text.replace(/^####\s+(.+)$/gm, '<h4>$1</h4>');
+    text = text.replace(/^###\s+(.+)$/gm, '<h3>$1</h3>');
+    text = text.replace(/^##\s+(.+)$/gm, '<h2>$1</h2>');
+    text = text.replace(/^#\s+(.+)$/gm, '<h1>$1</h1>');
+
+    // 水平线
+    text = text.replace(/^---+$/gm, '<hr class="md-hr">');
+    text = text.replace(/^\*\*\*+$/gm, '<hr class="md-hr">');
+
+    // 粗体 + 斜体 + 删除线
+    text = text.replace(/\*\*\*(.+?)\*\*\*/g, '<strong><em>$1</em></strong>');
+    text = text.replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>');
+    text = text.replace(/\*(.+?)\*/g, '<em>$1</em>');
+    text = text.replace(/~~(.+?)~~/g, '<del>$1</del>');
+
+    // 链接
+    text = text.replace(/\[([^\]]+)\]\(([^)]+)\)/g, '<a href="$2" target="_blank">$1</a>');
+
+    // 图片
+    text = text.replace(/!\[([^\]]*)\]\(([^)]+)\)/g, '<img src="$2" alt="$1" class="md-img">');
+
+    // 引用
+    text = text.replace(/^&gt;\s+(.+)$/gm, '<blockquote class="md-quote">$1</blockquote>');
+
+    // 无序列表
+    text = text.replace(/^[\-\*]\s+(.+)$/gm, '<li class="md-li">$1</li>');
+    // 有序列表
+    text = text.replace(/^\d+\.\s+(.+)$/gm, '<li class="md-li-ol">$1</li>');
+
+    // 合并连续 li 为 ul/ol
+    text = text.replace(/((?:<li class="md-li">.*<\/li>\n?)+)/g, '<ul class="md-ul">$1</ul>');
+    text = text.replace(/((?:<li class="md-li-ol">.*<\/li>\n?)+)/g, '<ol class="md-ol">$1</ol>');
+
+    // 段落：非标签行用 <p> 包裹
+    var lines = text.split('\n');
+    var result = [];
+    for (var i = 0; i < lines.length; i++) {
+        var line = lines[i];
+        if (!line.trim()) { result.push(''); continue; }
+        if (/^<(h[1-6]|ul|ol|li|table|pre|blockquote|hr|div)/.test(line.trim())) {
+            result.push(line);
+            continue;
+        }
+        result.push('<p class="md-p">' + line + '</p>');
+    }
+    text = result.join('\n');
+
+    // 恢复代码块
+    for (var i = 0; i < codeBlocks.length; i++) {
+        text = text.replace('\x00CODEBLOCK' + i + '\x00', codeBlocks[i]);
+    }
+    for (var i = 0; i < inlineCodes.length; i++) {
+        text = text.replace('\x00INLINECODE' + i + '\x00', inlineCodes[i]);
+    }
+
+    return text;
+}
+
+function scrollToBottom() {
+    chatMessages.scrollTop = chatMessages.scrollHeight;
+}
+
+function getTimestamp() {
+    var d = new Date();
+    return d.getHours().toString().padStart(2, '0') + ':' +
+           d.getMinutes().toString().padStart(2, '0') + ':' +
+           d.getSeconds().toString().padStart(2, '0');
+}
+
+// ===== 消息渲染 =====
+
+function addUserMessage(text) {
+    var div = document.createElement('div');
+    div.className = 'message user-message';
+    div.innerHTML = '<div class="message-content">' + escapeHtml(text) + '</div>';
+    chatMessages.appendChild(div);
+    scrollToBottom();
+}
+
+function addSystemMessage(html, extraClass) {
+    var div = document.createElement('div');
+    div.className = 'message system-message' + (extraClass ? ' ' + extraClass : '');
+    div.innerHTML = '<div class="message-content">' + html + '</div>';
+    chatMessages.appendChild(div);
+    scrollToBottom();
+    return div;
+}
+
+function addProgressMessage(html, type) {
+    var div = document.createElement('div');
+    div.className = 'message progress-message' + (type ? ' progress-' + type : '');
+    var time = getTimestamp();
+    div.innerHTML = '<div class="message-content"><span class="msg-time">[' + time + ']</span> ' + html + '</div>';
+    chatMessages.appendChild(div);
+    scrollToBottom();
+    return div;
+}
+
+function addLogEntry(stage, message, logType) {
+    var div = document.createElement('div');
+    div.className = 'log-entry log-' + (logType || 'info');
+    div.innerHTML = '<span class="log-stage">[' + stage + ']</span><span class="log-message">' + escapeHtml(message) + '</span>';
+    return div;
+}
+
+function addPhaseCard(phaseName, status) {
+    var labels = {
+        'data_collection': '数据采集',
+        'perception': '感知分析',
+        'modeling': '建模分析',
+        'reasoning': '推理规划',
+        'decision': '决策评估',
+        'report': '报告生成',
+    };
+    var label = labels[phaseName] || phaseName;
+    var statusClass = status === 'completed' ? 'phase-done' : 'phase-active';
+    var statusIcon = status === 'completed' ? '&#10003;' : '&#9679;';
+
+    var card = document.getElementById('phase-' + phaseName);
+    if (!card) {
+        var container = document.getElementById('phaseContainer');
+        if (!container) {
+            container = document.createElement('div');
+            container.id = 'phaseContainer';
+            container.className = 'phase-container';
+            chatMessages.appendChild(container);
+        }
+        card = document.createElement('div');
+        card.id = 'phase-' + phaseName;
+        card.className = 'phase-card ' + statusClass;
+        card.innerHTML = '<span class="phase-icon">' + statusIcon + '</span><span class="phase-label">' + label + '</span><span class="phase-status-text">' + (status === 'completed' ? '完成' : '进行中...') + '</span>';
+        container.appendChild(card);
+        scrollToBottom();
+    } else {
+        card.className = 'phase-card ' + statusClass;
+        card.innerHTML = '<span class="phase-icon">' + statusIcon + '</span><span class="phase-label">' + label + '</span><span class="phase-status-text">' + (status === 'completed' ? '完成' : '进行中...') + '</span>';
+    }
+}
+
+function addResultSummary(phase, summary) {
+    var div = document.createElement('div');
+    div.className = 'result-summary';
+    div.innerHTML = '<strong>' + phase + '</strong>: ' + escapeHtml(summary);
+    chatMessages.appendChild(div);
+    scrollToBottom();
+}
+
+function addLLMRecordToggle(stage) {
+    var existing = document.getElementById('llmSection');
+    if (!existing) {
+        var section = document.createElement('div');
+        section.id = 'llmSection';
+        section.className = 'llm-section';
+        section.innerHTML = '<div class="llm-header" onclick="toggleLLMSection()">' +
+            '<span id="llmToggleIcon">&#9654;</span> 查看大模型调用记录 (' + stage + ')</div>' +
+            '<div id="llmContent" class="llm-content-area" style="display:none;"></div>';
+        chatMessages.appendChild(section);
+        scrollToBottom();
+    } else {
+        var header = existing.querySelector('.llm-header');
+        header.innerHTML = '<span id="llmToggleIcon">&#9654;</span> 查看大模型调用记录';
+        var content = document.getElementById('llmContent');
+        content.innerHTML = '';
+    }
+}
+
+function addLLMRecord(record) {
+    var content = document.getElementById('llmContent');
+    if (!content) return;
+    var idx = content.children.length + 1;
+    var div = document.createElement('div');
+    div.className = 'llm-record';
+    div.innerHTML = '<h4>调用 #' + idx + ': ' + escapeHtml(record.stage || '') + '</h4>' +
+        '<div class="llm-toggle" onclick="toggleRecord(this)"><span class="llm-arrow">&#9654;</span> 查看提示词</div>' +
+        '<div class="llm-collapse" style="display:none;">' +
+        '  <h5>System Prompt:</h5><pre>' + escapeHtml(record.system_prompt || '') + '</pre>' +
+        '  <h5>User Prompt:</h5><pre>' + escapeHtml(record.user_prompt || '') + '</pre>' +
+        '</div>' +
+        '<div class="llm-toggle" onclick="toggleRecord(this)"><span class="llm-arrow">&#9654;</span> 查看回复</div>' +
+        '<div class="llm-collapse" style="display:none;"><pre>' + escapeHtml(record.response || '') + '</pre></div>';
+    content.appendChild(div);
+}
+
+function addReportContent(html) {
+    var div = document.createElement('div');
+    div.className = 'report-card';
+    div.innerHTML = '<h3>分析报告</h3><div class="report-body">' + markedToHtml(html) + '</div>';
+    chatMessages.appendChild(div);
+    scrollToBottom();
+}
+
+function addError(text) {
+    var div = document.createElement('div');
+    div.className = 'message error-message';
+    div.innerHTML = '<div class="message-content">错误: ' + escapeHtml(text) + '</div>';
+    chatMessages.appendChild(div);
+    scrollToBottom();
+}
+
+// ===== 交互控制 =====
+
+function setInputEnabled(enabled) {
+    chatInput.disabled = !enabled;
+    sendBtn.disabled = !enabled;
+    if (enabled) {
+        sendBtn.textContent = '发送';
+        inputHint.textContent = '按 Enter 发送，Shift+Enter 换行';
+        chatInput.focus();
+    } else {
+        sendBtn.textContent = '处理中...';
+        inputHint.textContent = '请等待当前操作完成';
+    }
+}
+
+function clearPhaseContainer() {
+    var existing = document.getElementById('phaseContainer');
+    if (existing) existing.remove();
+}
+
+function clearLLMSection() {
+    var existing = document.getElementById('llmSection');
+    if (existing) existing.remove();
+}
+
+function clearHistory() {
+    if (!confirm('确定要清空当前对话记录吗？')) return;
+    // 只保留系统欢迎消息
+    var welcome = chatMessages.querySelector('.system-message');
+    chatMessages.innerHTML = '';
+    if (welcome) chatMessages.appendChild(welcome);
+    clearPhaseContainer();
+    clearLLMSection();
+    llmRecords = [];
+    allLogs = [];
+    currentState = STATE.idle;
+    pendingIntent = null;
+    currentStock = null;
+    pendingSwitch = null;
+    isProcessing = false;
+    setInputEnabled(true);
+    clearStockTag();
+    // 清除 localStorage 中的历史
+    try { localStorage.removeItem(STORAGE_KEY); } catch(e) {}
+}
+
+function updateStockTag(code, name) {
+    var tag = document.getElementById('chatStockTag');
+    if (!tag) return;
+    tag.textContent = (name || code) + ' (' + code + ')';
+    tag.style.display = 'inline-block';
+}
+
+function clearStockTag() {
+    var tag = document.getElementById('chatStockTag');
+    if (!tag) return;
+    tag.style.display = 'none';
+    tag.textContent = '';
+}
+
+// ===== 主流程 =====
+
+async function sendMessage() {
+    if (isProcessing) return;
+    var text = chatInput.value.trim();
+    if (!text) return;
+
+    chatInput.value = '';
+    addUserMessage(text);
+
+    if (currentState === STATE.idle) {
+        await handleIntent(text);
+    } else if (currentState === STATE.awaiting_input && pendingIntent) {
+        if (pendingIntent.intent_type === 'analyze' || pendingIntent.intent_type === 'quote') {
+            currentStock = {code: pendingIntent.stock_code, name: pendingIntent.stock_name, position_status: pendingIntent.position_status || '', cost_price: pendingIntent.cost_price || null, position_quantity: pendingIntent.position_quantity || null};
+            await startStreamingAnalysis(pendingIntent.stock_code, text, pendingIntent.position_status || '', pendingIntent.cost_price || null, pendingIntent.position_quantity || null);
+        } else if (pendingIntent.intent_type === 'screen') {
+            await startScreening(text);
+        }
+    } else if (currentState === STATE.follow_up && currentStock) {
+        await handleFollowUp(text);
+    } else if (currentState === STATE.confirm_switch && pendingSwitch) {
+        await handleSwitchConfirm(text);
+    }
+}
+
+async function handleIntent(query) {
+    isProcessing = true;
+    setInputEnabled(false);
+    currentState = STATE.waiting_intent;
+
+    addSystemMessage('<p><strong>识别意图中...</strong></p>');
+
+    try {
+        var resp = await fetch('/api/intent', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({query: query})
+        });
+        var data = await resp.json();
+
+        if (!resp.ok || data.intent_type === 'unknown') {
+            addSystemMessage('<p>无法识别您的需求，请重新输入。提示：可以输入股票名称、代码，或描述您的分析需求。</p>');
+            currentState = STATE.idle;
+            isProcessing = false;
+            setInputEnabled(true);
+            return;
+        }
+
+        pendingIntent = data;
+
+        if (data.intent_type === 'analyze' || data.intent_type === 'quote') {
+            var stockName = data.stock_name || '';
+            var stockCode = data.stock_code || '';
+            currentStock = {code: stockCode, name: stockName, position_status: data.position_status || '', cost_price: data.cost_price || null, position_quantity: data.position_quantity || null};
+            updateStockTag(stockCode, stockName);
+            addSystemMessage(
+                '<p><strong>已识别:</strong> 分析股票 <strong>' + escapeHtml(stockName || stockCode) + '</strong> (' + stockCode + ')，正在开始分析...</p>'
+            );
+            // 意图识别成功后直接进入分析流程，不再等待用户二次输入
+            await startStreamingAnalysis(stockCode, data.user_preference || '', data.position_status || '', data.cost_price || null, data.position_quantity || null);
+            return;
+        } else if (data.intent_type === 'screen') {
+            addSystemMessage(
+                '<p><strong>已识别:</strong> 智能选股，正在开始筛选...</p>'
+            );
+            // 意图识别成功后直接进入选股流程，不再等待用户二次输入
+            // v2.6.2: 透传用户原始输入（含数量描述，如"10支股票"），
+            // 由后端抽取器识别推荐数量；user_preference 会剥离数量导致始终默认 30
+            await startScreening(query);
+            return;
+        }
+
+        setInputEnabled(true);
+    } catch (err) {
+        addError('意图识别请求失败: ' + err.message);
+        currentState = STATE.idle;
+        setInputEnabled(true);
+    }
+
+    isProcessing = false;
+}
+
+async function handleFollowUp(text) {
+    // 在跟进状态下，检查用户是否想切换股票或改变意图
+    isProcessing = true;
+    setInputEnabled(false);
+
+    try {
+        var resp = await fetch('/api/intent', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({query: text})
+        });
+        var data = await resp.json();
+
+        // 如果用户想选股，重置状态并直接进入选股流程
+        if (data.intent_type === 'screen') {
+            var curName = currentStock.name || currentStock.code;
+            addSystemMessage('<p>已结束对 <strong>' + escapeHtml(curName) + '</strong> 的分析，进入选股模式，正在开始筛选...</p>');
+            currentState = STATE.idle;
+            currentStock = null;
+            // 意图识别成功后直接进入选股流程，不再等待用户二次输入
+            // v2.6.2: 透传用户原始输入，保留数量描述供后端抽取推荐数量
+            await startScreening(text);
+            return;
+        }
+
+        // 意图识别为 unknown 时，显示错误信息并停止，不继续分析
+        if (data.intent_type === 'unknown') {
+            var errMsg = data.message || '无法识别您的需求，请重新输入。';
+            addSystemMessage('<p>' + escapeHtml(errMsg) + '</p>');
+            currentState = STATE.follow_up;
+            isProcessing = false;
+            setInputEnabled(true);
+            return;
+        }
+
+        // 如果意图识别到了新的股票代码，且与当前股票不同 → 需要确认切换
+        if (data.stock_code && data.stock_code !== currentStock.code) {
+            var newName = data.stock_name || data.stock_code;
+            var curName = currentStock.name || currentStock.code;
+            pendingSwitch = {code: data.stock_code, name: newName};
+            currentState = STATE.confirm_switch;
+            addSystemMessage(
+                '<p>当前正在分析 <strong>' + escapeHtml(curName) + '</strong>（' + currentStock.code + '），' +
+                '检测到您想切换到 <strong>' + escapeHtml(newName) + '</strong>（' + data.stock_code + '）。</p>' +
+                '<p>输入 <strong>"是"</strong> 或 <strong>"确认"</strong> 切换股票，输入其他内容则继续分析当前股票。</p>'
+            );
+            isProcessing = false;
+            setInputEnabled(true);
+            return;
+        }
+
+        // 未识别到新股票，或识别到的是当前股票 → 直接继续分析
+        await startStreamingAnalysis(currentStock.code, text, currentStock.position_status || '', currentStock.cost_price || null, currentStock.position_quantity || null);
+        return;
+
+    } catch (err) {
+        addError('意图识别请求失败: ' + err.message);
+        currentState = STATE.follow_up;
+        setInputEnabled(true);
+    }
+
+    isProcessing = false;
+}
+
+async function handleSwitchConfirm(text) {
+    // 检查用户是否确认切换
+    var trimmed = text.trim();
+    if (trimmed === '是' || trimmed === '确认' || trimmed === '切换' || trimmed === 'y' || trimmed === 'yes' || trimmed === 'Y' || trimmed === 'YES') {
+        // 用户确认切换
+        var curName = currentStock.name || currentStock.code;
+        addSystemMessage('<p>已结束对 <strong>' + escapeHtml(curName) + '</strong> 的分析，切换到 <strong>' + escapeHtml(pendingSwitch.name || pendingSwitch.code) + '</strong></p>');
+        currentStock = null;
+        var newCode = pendingSwitch.code;
+        var newName = pendingSwitch.name;
+        pendingSwitch = null;
+        // 重新走意图流程
+        currentState = STATE.idle;
+        await handleIntent(newCode + ' ' + newName);
+    } else {
+        // 用户不想切换，继续分析当前股票
+        addSystemMessage('<p>继续分析 <strong>' + escapeHtml(currentStock.name || currentStock.code) + '</strong></p>');
+        currentState = STATE.follow_up;
+        pendingSwitch = null;
+        await startStreamingAnalysis(currentStock.code, text, currentStock.position_status || '', currentStock.cost_price || null, currentStock.position_quantity || null);
+    }
+}
+
+async function startStreamingAnalysis(code, userInput, positionStatus, costPrice, positionQuantity) {
+    isProcessing = true;
+    setInputEnabled(false);
+    currentState = STATE.analyzing;
+
+    clearPhaseContainer();
+    clearLLMSection();
+    addSystemMessage('<p><strong>开始分析 ' + code + '</strong> <span class="msg-time">[' + getTimestamp() + ']</span></p>');
+    addProgressMessage('正在执行 6 阶段分析流水线，请稍候...', 'info');
+
+    try {
+        var resp = await fetch('/api/analyze-stream/' + code, {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({
+                user_input: userInput || '',
+                position_status: positionStatus || '',
+                cost_price: costPrice || null,
+                position_quantity: positionQuantity || null
+            })
+        });
+
+        if (!resp.ok) {
+            var errData = await resp.json().catch(function() { return {detail: 'HTTP ' + resp.status}; });
+            addError(errData.detail || '分析请求失败: HTTP ' + resp.status);
+            currentState = STATE.follow_up;
+            setInputEnabled(true);
+            isProcessing = false;
+            var stockName = currentStock ? currentStock.name || currentStock.code : code;
+            addSystemMessage('<p>您可以继续对 <strong>' + escapeHtml(stockName) + '</strong> 提出分析需求，或输入其他股票代码切换</p>');
+            return;
+        }
+
+        // 使用 SSE 流式读取
+        var reader = resp.body.getReader();
+        var decoder = new TextDecoder();
+        var buffer = '';
+        var eventType = '';
+        var eventData = '';
+
+        while (true) {
+            var result = await reader.read();
+            if (result.done) break;
+
+            buffer += decoder.decode(result.value, {stream: true});
+
+            var lines = buffer.split('\n');
+            buffer = '';
+
+            for (var i = 0; i < lines.length; i++) {
+                var line = lines[i];
+
+                if (line.startsWith('event: ')) {
+                    eventType = line.substring(7).trim();
+                } else if (line.startsWith('data: ')) {
+                    eventData = line.substring(6);
+                } else if (line === '' && eventType && eventData) {
+                    try {
+                        var data = JSON.parse(eventData);
+                        handleSSEEvent(eventType, data);
+                    } catch (e) {
+                        console.error('解析SSE事件失败:', e, eventData);
+                    }
+                    eventType = '';
+                    eventData = '';
+                } else if (line !== '') {
+                    buffer = line + '\n' + buffer;
+                }
+            }
+        }
+
+    } catch (err) {
+        addError('分析请求失败: ' + err.message);
+    }
+
+    setInputEnabled(true);
+    currentState = STATE.follow_up;
+    var stockName = currentStock ? currentStock.name || currentStock.code : code;
+    addSystemMessage('<p>您可以继续对 <strong>' + escapeHtml(stockName) + '</strong> 提出分析需求，或输入其他股票代码切换</p>');
+    isProcessing = false;
+}
+
+function handleSSEEvent(eventType, data) {
+    switch (eventType) {
+        case 'phase':
+            addPhaseCard(data.phase, data.status);
+            break;
+
+        case 'log':
+            // 实时日志显示在进度区域
+            var phaseContainer = document.getElementById('phaseContainer');
+            if (phaseContainer) {
+                var logEntry = addLogEntry(data.stage || data.type, data.message, data.log_type);
+                var logBox = phaseContainer.querySelector('.phase-log-box');
+                if (!logBox) {
+                    logBox = document.createElement('div');
+                    logBox.className = 'phase-log-box';
+                    phaseContainer.appendChild(logBox);
+                }
+                logBox.appendChild(logEntry);
+                scrollToBottom();
+            }
+            break;
+
+        case 'llm_call':
+            addLLMRecord(data);
+            break;
+
+        case 'result_summary':
+            var labels = {
+                'perception': '感知分析',
+                'modeling': '建模分析',
+                'reasoning': '推理规划',
+                'decision': '决策评估',
+            };
+            addResultSummary(labels[data.phase] || data.phase, data.summary);
+            break;
+
+        case 'data_collection':
+            // 数据采集完成，在聊天流中渲染近20日K线图
+            if (data && data.klines_recent && data.klines_recent.length > 0) {
+                renderKlineCard(data);
+            }
+            break;
+
+        case 'report':
+            addReportContent(data.content);
+            break;
+
+        case 'full_logs':
+            llmRecords = data.llm_records || [];
+            allLogs = data.logs || [];
+            addLLMRecordToggle(llmRecords.length + ' 次调用');
+            if (llmRecords.length > 0) {
+                for (var i = 0; i < llmRecords.length; i++) {
+                    addLLMRecord(llmRecords[i]);
+                }
+            }
+            break;
+
+        case 'error':
+            addError(data.message || '未知错误');
+            break;
+
+        case 'complete':
+            break;
+    }
+}
+
+// ===== 近20日K线图（ECharts） =====
+
+// 在聊天流中插入 K线图卡片
+function renderKlineCard(dc) {
+    // 用时间戳保证 id 唯一，避免与 localStorage 恢复的历史卡片冲突
+    var chartId = 'klineChart' + Date.now();
+    var div = document.createElement('div');
+    div.className = 'message system-message kline-card';
+    div.innerHTML = '<div class="message-content">' +
+        '<strong>近20日K线图</strong> <span class="msg-time">[' + getTimestamp() + ']</span>' +
+        '<div id="' + chartId + '" style="width:100%; height:380px; margin-top:8px;"></div>' +
+        '</div>';
+    chatMessages.appendChild(div);
+    scrollToBottom();
+    renderKlineChart(chartId, dc.klines_recent);
+}
+
+// 绘制K线蜡烛图（含MA均线 + 成交量副图）
+function renderKlineChart(chartId, klines) {
+    var chartDiv = document.getElementById(chartId);
+    if (!chartDiv) return;
+
+    // 图表数据
+    var dates = [];
+    var klineData = [];
+    var volumeData = [];
+    var ma5Data = [];
+    var ma10Data = [];
+    var ma20Data = [];
+
+    for (var i = 0; i < klines.length; i++) {
+        var k = klines[i];
+        dates.push(k.date);
+        // ECharts candlestick 数据格式: [open, close, low, high]
+        klineData.push([k.open, k.close, k.low, k.high]);
+        volumeData.push({value: k.volume, itemStyle: {color: k.close >= k.open ? '#ef232a' : '#14b143'}});
+        ma5Data.push(k.ma5 != null ? k.ma5 : '-');
+        ma10Data.push(k.ma10 != null ? k.ma10 : '-');
+        ma20Data.push(k.ma20 != null ? k.ma20 : '-');
+    }
+
+    // 若 ECharts 未加载（CDN 不可用），隐藏图表容器
+    if (typeof echarts === 'undefined') {
+        chartDiv.style.display = 'none';
+        return;
+    }
+
+    var chart = echarts.init(chartDiv);
+    chart.setOption({
+        animation: false,
+        legend: {
+            top: 0,
+            data: ['K线', 'MA5', 'MA10', 'MA20']
+        },
+        tooltip: {
+            trigger: 'axis',
+            axisPointer: {type: 'cross'}
+        },
+        grid: [
+            {left: 60, right: 20, top: 30, height: '55%'},
+            {left: 60, right: 20, top: '72%', height: '18%'}
+        ],
+        xAxis: [
+            {type: 'category', data: dates, boundaryGap: true},
+            {type: 'category', gridIndex: 1, data: dates, boundaryGap: true}
+        ],
+        yAxis: [
+            {scale: true},
+            {gridIndex: 1, scale: true, axisLabel: {show: false}}
+        ],
+        dataZoom: [
+            {type: 'inside', xAxisIndex: [0, 1], start: 0, end: 100},
+            {type: 'slider', xAxisIndex: [0, 1], bottom: 0, height: 16}
+        ],
+        series: [
+            {
+                name: 'K线',
+                type: 'candlestick',
+                data: klineData,
+                itemStyle: {
+                    color: '#ef232a',          // 阳线（上涨）填充色
+                    color0: '#14b143',          // 阴线（下跌）填充色
+                    borderColor: '#ef232a',
+                    borderColor0: '#14b143'
+                }
+            },
+            {
+                name: 'MA5',
+                type: 'line',
+                data: ma5Data,
+                smooth: true,
+                showSymbol: false,
+                lineStyle: {width: 1, color: '#f59e0b'}
+            },
+            {
+                name: 'MA10',
+                type: 'line',
+                data: ma10Data,
+                smooth: true,
+                showSymbol: false,
+                lineStyle: {width: 1, color: '#3b82f6'}
+            },
+            {
+                name: 'MA20',
+                type: 'line',
+                data: ma20Data,
+                smooth: true,
+                showSymbol: false,
+                lineStyle: {width: 1, color: '#8b5cf6'}
+            },
+            {
+                name: '成交量',
+                type: 'bar',
+                xAxisIndex: 1,
+                yAxisIndex: 1,
+                data: volumeData
+            }
+        ]
+    });
+
+    // 窗口尺寸变化时自适应
+    if (!chart._resizeHandler) {
+        chart._resizeHandler = function() { chart.resize(); };
+        window.addEventListener('resize', chart._resizeHandler);
+    }
+}
+
+// 根据用户输入关键词自动检测最匹配的选股策略
+function detectStrategy(userInput) {
+    var text = (userInput || '').toLowerCase();
+
+    // 超跌反弹: 超跌/反弹/抄底/跌幅/大跌/低吸/回调
+    if (/超跌|反弹|抄底|跌幅|大跌|低吸|回调/.test(text)) {
+        return 'oversold_rebound';
+    }
+
+    // 动量选股: 动量/强势/上涨/突破/活跃/放量/大涨/连涨
+    if (/动量|强势|上涨|突破|活跃|放量|大涨|连涨/.test(text)) {
+        return 'momentum';
+    }
+
+    // 价值选股: 低估/价值/白马/蓝筹/低pe/低pb/稳健/分红
+    if (/低估|价值|白马|蓝筹|低pe|低pb|稳健|分红|低估值/.test(text)) {
+        return 'value';
+    }
+
+    // 默认为价值选股
+    return 'value';
+}
+
+// 构建"当前筛选条件"展示区块（v2.6.0）
+function buildConditionsHtml(data) {
+    if (!data || !data.conditions || data.conditions.length === 0) {
+        return '';
+    }
+    var label = data.source_label || '筛选条件';
+    var chips = '';
+    for (var i = 0; i < data.conditions.length; i++) {
+        chips += '<span class="cond-chip">' + escapeHtml(data.conditions[i].display) + '</span>';
+    }
+    return '<div class="screen-conditions">' +
+        '<p class="cond-title">当前筛选条件<span class="cond-source">' + escapeHtml(label) + '</span></p>' +
+        '<div class="cond-chips">' + chips + '</div></div>';
+}
+
+async function startScreening(userInput) {
+    isProcessing = true;
+    setInputEnabled(false);
+    currentState = STATE.analyzing;
+
+    var strategy = detectStrategy(userInput);
+
+    addSystemMessage('<p><strong>开始智能选股...</strong> 使用策略: ' +
+        ({'value': '价值选股', 'momentum': '动量选股', 'oversold_rebound': '超跌反弹'}[strategy] || strategy) + '</p>');
+
+    try {
+        var resp = await fetch('/api/screen', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({user_input: userInput, strategy: strategy, top_n: 30})
+        });
+        var data = await resp.json();
+        if (resp.ok && data.results && data.results.length > 0) {
+            // 渲染选股结果列表
+            var html = '<p><strong>选股完成</strong><span class="msg-time">[' + getTimestamp() + ']</span> - 共 ' + data.total + ' 只股票符合条件</p>';
+            html += buildConditionsHtml(data);
+            html += '<div class="screen-results">';
+            html += '<table class="screen-table"><thead><tr><th>代码</th><th>名称</th><th>评分</th><th>选择意见</th><th>操作</th></tr></thead><tbody>';
+            for (var i = 0; i < data.results.length; i++) {
+                var r = data.results[i];
+                var scorePct = Math.round(r.score * 100);
+                var scoreColor = scorePct >= 100 ? '#22c55e' : scorePct >= 67 ? '#f59e0b' : '#ef4444';
+                html += '<tr>';
+                html += '<td>' + escapeHtml(r.code) + '</td>';
+                html += '<td>' + escapeHtml(r.name) + '</td>';
+                html += '<td><span style="color:' + scoreColor + ';font-weight:600;">' + scorePct + '</span></td>';
+                html += '<td style="font-size:0.82rem;color:#555;max-width:280px;white-space:normal;">' + escapeHtml(r.reason || '') + '</td>';
+                html += '<td><button class="analyze-btn" onclick="quickAnalyze(\'' + escapeHtml(r.code) + '\', \'' + escapeHtml(r.name) + '\')">分析</button></td>';
+                html += '</tr>';
+            }
+            html += '</tbody></table></div>';
+            addSystemMessage(html, 'screen-result-msg');
+            currentState = STATE.idle;
+        } else if (resp.ok) {
+            var html = '<p><strong>选股完成</strong><span class="msg-time">[' + getTimestamp() + ']</span> - ' + (data.total || 0) + ' 只股票符合条件</p>';
+            html += buildConditionsHtml(data);
+            addSystemMessage(html);
+            currentState = STATE.idle;
+        } else {
+            addError(data.detail || '选股失败');
+            currentState = STATE.idle;
+        }
+    } catch (err) {
+        addError('选股请求失败: ' + err.message);
+        currentState = STATE.idle;
+    }
+
+    setInputEnabled(true);
+    isProcessing = false;
+}
+
+// 从选股结果快速发起分析（直接进入分析，不再等待用户二次输入）
+function quickAnalyze(code, name) {
+    if (isProcessing) return;
+
+    // 先清空之前的对话状态
+    currentState = STATE.idle;
+    currentStock = null;
+    pendingSwitch = null;
+    pendingIntent = null;
+
+    currentStock = {code: code, name: name};
+    updateStockTag(code, name);
+
+    addSystemMessage('<p>已选择 <strong>' + escapeHtml(name) + '</strong>（' + code + '），正在开始分析...</p>');
+    startStreamingAnalysis(code, '');
+}
+
+// ===== UI 交互辅助 =====
+
+function toggleLLMSection() {
+    var content = document.getElementById('llmContent');
+    var icon = document.getElementById('llmToggleIcon');
+    if (!content || !icon) return;
+    if (content.style.display === 'none') {
+        content.style.display = 'block';
+        icon.innerHTML = '&#9660;';
+    } else {
+        content.style.display = 'none';
+        icon.innerHTML = '&#9654;';
+    }
+}
+
+function toggleRecord(el) {
+    var collapse = el.nextElementSibling;
+    var arrow = el.querySelector('.llm-arrow');
+    if (!collapse || !arrow) return;
+    if (collapse.style.display === 'none') {
+        collapse.style.display = 'block';
+        arrow.innerHTML = '&#9660;';
+    } else {
+        collapse.style.display = 'none';
+        arrow.innerHTML = '&#9654;';
+    }
+}
+
+// ===== 会话持久化 =====
+
+var STORAGE_KEY = 'stock_chat_history';
+var SAVE_DEBOUNCE = null;
+
+function saveChatState() {
+    if (SAVE_DEBOUNCE) clearTimeout(SAVE_DEBOUNCE);
+    SAVE_DEBOUNCE = setTimeout(function() {
+        try {
+            var msgContainer = document.getElementById('chatMessages');
+            if (!msgContainer) return;
+            var html = msgContainer.innerHTML;
+            var stateData = {
+                html: html,
+                currentStock: currentStock ? {code: currentStock.code, name: currentStock.name} : null,
+                timestamp: Date.now()
+            };
+            localStorage.setItem(STORAGE_KEY, JSON.stringify(stateData));
+        } catch (e) {
+            console.warn('Save chat state failed:', e);
+        }
+    }, 500);
+}
+
+function restoreChatState() {
+    try {
+        var saved = localStorage.getItem(STORAGE_KEY);
+        if (!saved) return false;
+
+        var stateData = JSON.parse(saved);
+        var msgContainer = document.getElementById('chatMessages');
+        if (!msgContainer) return false;
+
+        var tempDiv = document.createElement('div');
+        tempDiv.innerHTML = stateData.html;
+        var msgCount = tempDiv.querySelectorAll('.message, .phase-container, .result-summary, .report-card, .llm-section').length;
+        if (msgCount <= 1) return false;
+
+        msgContainer.innerHTML = stateData.html;
+        // 历史中的 K线图 canvas 无法通过 innerHTML 持久化，替换为提示文本
+        var oldCharts = msgContainer.querySelectorAll('[id^="klineChart"]');
+        for (var ci = 0; ci < oldCharts.length; ci++) {
+            oldCharts[ci].outerHTML = '<p class="kline-stale-tip">历史K线图已过期，重新分析可查看最新图表</p>';
+        }
+        // 恢复后重新挂载 MutationObserver
+        if (msgContainer._observer) msgContainer._observer.disconnect();
+        setupChatObserver();
+
+        if (stateData.currentStock) {
+            currentStock = stateData.currentStock;
+            currentState = STATE.follow_up;
+        }
+
+        scrollToBottom();
+        return true;
+    } catch (e) {
+        console.warn('Restore chat state failed:', e);
+        return false;
+    }
+}
+
+// 使用 MutationObserver 自动监听聊天区域变化并保存
+function setupChatObserver() {
+    var msgContainer = document.getElementById('chatMessages');
+    if (!msgContainer) return;
+    if (msgContainer._observer) msgContainer._observer.disconnect();
+    msgContainer._observer = new MutationObserver(function() {
+        saveChatState();
+    });
+    msgContainer._observer.observe(msgContainer, {
+        childList: true,
+        subtree: true,
+        characterData: false
+    });
+}
+
+// ===== 键盘事件 =====
+chatInput.addEventListener('keydown', function(e) {
+    if (e.key === 'Enter' && !e.shiftKey) {
+        e.preventDefault();
+        sendMessage();
+    }
+});
+
+// ===== 初始化 =====
+setInputEnabled(true);
+setupChatObserver();
+
+// 恢复对话历史，并加载侧边栏
+restoreChatState();
+loadCachedStocks();
+
+// ===== 已分析过的股票列表 =====
+var _sidebarAllStocks = []; // 缓存全量数据供搜索过滤
+
+// 检测 URL 参数 ?analyze={code}，自动触发分析
+(function() {
+    var params = new URLSearchParams(window.location.search);
+    var analyzeCode = params.get('analyze');
+    if (analyzeCode && !isProcessing) {
+        // 等待侧边栏数据加载完成后，再触发分析（以便获取股票名称）
+        var waitAndAnalyze = setInterval(function() {
+            if (_sidebarAllStocks.length > 0 || document.getElementById('cachedStocksList').innerHTML.indexOf('加载') !== -1) {
+                clearInterval(waitAndAnalyze);
+                var stock = _sidebarAllStocks.find(function(s) { return s.code === analyzeCode; });
+                var name = stock ? stock.name : '';
+                quickAnalyze(analyzeCode, name);
+                // 清理 URL 参数
+                window.history.replaceState({}, '', '/');
+            }
+        }, 200);
+        // 兜底：最多等待 5 秒
+        setTimeout(function() {
+            clearInterval(waitAndAnalyze);
+            if (!isProcessing) {
+                quickAnalyze(analyzeCode, '');
+                window.history.replaceState({}, '', '/');
+            }
+        }, 5000);
+    }
+})();
+
+function loadCachedStocks() {
+    fetch('/api/cached-stocks')
+        .then(function(resp) { return resp.json(); })
+        .then(function(data) {
+            var section = document.getElementById('cachedStocksSection');
+            var list = document.getElementById('cachedStocksList');
+            var count = document.getElementById('cachedStocksCount');
+            if (!data.results || data.results.length === 0) {
+                list.innerHTML = '<div class="sidebar-loading">暂无已分析的股票数据</div>';
+                section.style.display = 'flex';
+                return;
+            }
+            _sidebarAllStocks = data.results;
+            section.style.display = 'flex';
+            count.textContent = data.results.length + ' 只';
+
+            var html = '';
+            data.results.forEach(function(s) {
+                html += renderStockCard(s);
+            });
+            list.innerHTML = html;
+        })
+        .catch(function() {
+            var section = document.getElementById('cachedStocksSection');
+            section.style.display = 'flex';
+            var list = document.getElementById('cachedStocksList');
+            list.innerHTML = '<div class="sidebar-loading">加载失败</div>';
+        });
+}
+
+function renderStockCard(s) {
+    var flowLabels = {'inflow': '资金流入', 'outflow': '资金流出', 'balanced': '资金平衡'};
+    var html = '<div class="cached-stock-item" onclick="quickCachedAnalyze(\'' + escapeHtml(s.code) + '\')" title="点击分析此股票">';
+    html += '<div class="stock-row1">';
+    html += '  <span class="cached-stock-code">' + escapeHtml(s.code) + '</span>';
+    if (s.name) {
+        html += '  <span class="cached-stock-name">' + escapeHtml(s.name) + '</span>';
+    }
+    html += '</div>';
+    html += '<div class="cached-stock-info">';
+    if (s.investment_value_score != null) {
+        var vc = s.investment_value_score >= 70 ? 'score-high' : (s.investment_value_score >= 50 ? 'score-mid' : 'score-low');
+        html += '  <span class="cached-stock-badge ' + vc + '">' + s.investment_value_score + '分</span>';
+    }
+    if (s.capital_flow_direction) {
+        var fc = s.capital_flow_direction === 'inflow' ? 'flow-in' : 'flow-out';
+        html += '  <span class="cached-stock-badge ' + fc + '">' + escapeHtml(flowLabels[s.capital_flow_direction] || s.capital_flow_direction) + '</span>';
+    }
+    if (s.risk_level) {
+        var rc = s.risk_level === '低' ? 'risk-low' : (s.risk_level === '中' ? 'risk-mid' : 'risk-high');
+        html += '  <span class="cached-stock-badge ' + rc + '">风险' + escapeHtml(s.risk_level) + '</span>';
+    }
+    if (s.is_active_stock) {
+        html += '  <span class="cached-stock-badge active">活跃股</span>';
+    }
+    if (s.investment_value) {
+        html += '  <span class="cached-stock-badge active">' + escapeHtml(s.investment_value) + '</span>';
+    }
+    html += '</div>';
+    html += '<div class="cached-stock-meta">采集于 ' + escapeHtml((s.fetched_at || '').substring(0, 16)) + '</div>';
+    html += '</div>';
+    return html;
+}
+
+function filterSidebarStocks(value) {
+    var list = document.getElementById('cachedStocksList');
+    if (!list) return;
+    var q = value.trim().toLowerCase();
+    if (!q) {
+        // 恢复全量
+        list.innerHTML = _sidebarAllStocks.map(function(s) { return renderStockCard(s); }).join('');
+        return;
+    }
+    var filtered = _sidebarAllStocks.filter(function(s) {
+        return s.code.indexOf(q) !== -1 || (s.name || '').toLowerCase().indexOf(q) !== -1;
+    });
+    if (filtered.length === 0) {
+        list.innerHTML = '<div class="sidebar-loading">无匹配结果</div>';
+    } else {
+        list.innerHTML = filtered.map(function(s) { return renderStockCard(s); }).join('');
+    }
+}
+
+function quickCachedAnalyze(code) {
+    if (isProcessing) return;
+    // 从缓存列表中获取股票名称
+    var stock = _sidebarAllStocks.find(function(s) { return s.code === code; });
+    var name = stock ? stock.name : '';
+    quickAnalyze(code, name);
+}
+</script>
+{% endblock %}

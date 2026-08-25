@@ -1,0 +1,922 @@
+{% extends "base.html" %}
+{% block title %}分析 {{ code }} - 智能股票分析助手{% endblock %}
+
+{% block content %}
+<h1>个股分析：{{ code }}</h1>
+
+<div class="card">
+    <h2>你的投资意见（可选）</h2>
+    <p>输入你的关注点或投资偏好，大模型将重点分析你关心的方向。</p>
+    <div class="user-input-box">
+        <div class="position-input-row">
+            <label for="positionStatus">持仓状态：</label>
+            <select id="positionStatus" onchange="toggleCostPriceInput()">
+                <option value="">未提及</option>
+                <option value="未买入">未买入</option>
+                <option value="已持仓">已买入（持仓）</option>
+            </select>
+            <input type="number" id="costPrice" placeholder="成本价（元）" step="0.01" min="0" style="display:none;">
+            <input type="number" id="positionQuantity" placeholder="持仓数量（股）" step="1" min="1" style="display:none;">
+        </div>
+        <textarea id="userInput" rows="3" placeholder="例如：我主要关注短期技术面走势，想了解最近是否有主力资金介入..."></textarea>
+        <button id="startAnalyzeBtn" class="btn" onclick="startAnalysis(false)">开始分析</button>
+        <button id="refreshAnalyzeBtn" class="btn btn-refresh" onclick="startAnalysis(true)" title="跳过缓存，强制从数据源重新拉取所有数据">强制刷新</button>
+    </div>
+</div>
+
+<div id="progressSection" class="card" style="display:none;">
+    <h2>分析进度</h2>
+    <div id="logContainer" class="log-container"></div>
+</div>
+
+<div id="loading" class="loading" style="display:none;">
+    <p>正在采集数据并进行分析（6 阶段流水线）...</p>
+</div>
+
+<!-- 阶段 0：数据采集结果 -->
+<div id="stageDataCollection" class="card stage-result-card" style="display:none;">
+    <h2 onclick="toggleStage('dataCollection')" style="cursor:pointer;">
+        <span class="stage-badge bg-blue">阶段0</span> 数据采集结果
+        <span class="toggle-icon">&#9660;</span>
+    </h2>
+    <div id="stageDataCollectionBody" class="stage-body">
+        <div id="dataCollectionContent"></div>
+        <!-- 近20日K线图 -->
+        <div id="klineChartContainer" style="display:none; margin-top:16px;">
+            <h3 style="margin-bottom:8px;">近20日K线图</h3>
+            <div id="klineChart" style="width:100%; height:400px;"></div>
+        </div>
+    </div>
+</div>
+
+<!-- 9维度扩展分析 -->
+<div id="stageExtendedAnalysis" class="card stage-result-card" style="display:none;">
+    <h2 onclick="toggleStage('extendedAnalysis')" style="cursor:pointer;">
+        <span class="stage-badge bg-green">扩展</span> 9维度深入分析
+        <span class="toggle-icon">&#9660;</span>
+    </h2>
+    <div id="stageExtendedAnalysisBody" class="stage-body">
+        <div id="extendedAnalysisContent"></div>
+    </div>
+</div>
+
+<!-- 阶段 1：感知分析 -->
+<div id="stagePerception" class="card stage-result-card" style="display:none;">
+    <h2 onclick="toggleStage('perception')" style="cursor:pointer;">
+        <span class="stage-badge bg-purple">阶段1</span> 感知分析结果
+        <span class="toggle-icon">&#9660;</span>
+    </h2>
+    <div id="stagePerceptionBody" class="stage-body">
+        <div id="perceptionContent"></div>
+    </div>
+</div>
+
+<!-- 阶段 2：建模分析 -->
+<div id="stageModeling" class="card stage-result-card" style="display:none;">
+    <h2 onclick="toggleStage('modeling')" style="cursor:pointer;">
+        <span class="stage-badge bg-purple">阶段2</span> 建模分析结果
+        <span class="toggle-icon">&#9660;</span>
+    </h2>
+    <div id="stageModelingBody" class="stage-body">
+        <div id="modelingContent"></div>
+    </div>
+</div>
+
+<!-- 阶段 3：推理分析 -->
+<div id="stageReasoning" class="card stage-result-card" style="display:none;">
+    <h2 onclick="toggleStage('reasoning')" style="cursor:pointer;">
+        <span class="stage-badge bg-purple">阶段3</span> 推理分析结果（3个方案对比）
+        <span class="toggle-icon">&#9660;</span>
+    </h2>
+    <div id="stageReasoningBody" class="stage-body">
+        <div id="reasoningContent"></div>
+    </div>
+</div>
+
+<!-- 阶段 4：决策结果 -->
+<div id="stageDecision" class="card stage-result-card" style="display:none;">
+    <h2 onclick="toggleStage('decision')" style="cursor:pointer;">
+        <span class="stage-badge bg-purple">阶段4</span> 决策结果
+        <span class="toggle-icon">&#9660;</span>
+    </h2>
+    <div id="stageDecisionBody" class="stage-body">
+        <div id="decisionContent"></div>
+    </div>
+</div>
+
+<!-- 最终报告 -->
+<div id="reportCard" class="card" style="display:none;">
+    <h2>最终分析报告</h2>
+    <div id="report" class="report-content"></div>
+</div>
+
+<div id="error" class="error-msg" style="display:none;"></div>
+
+<div id="llmRecordsSection" class="card" style="display:none;">
+    <h2 onclick="toggleLlmRecords()" style="cursor:pointer;">
+        大模型调用记录 <span id="llmToggleIcon">&#9654;</span>
+    </h2>
+    <p class="subtitle">点击展开查看发送给大模型的完整提示词和大模型的回复</p>
+    <div id="llmRecordsContainer" class="llm-records-container" style="display:none;"></div>
+</div>
+
+<div class="card">
+    <p><a href="/">返回首页</a></p>
+</div>
+{% endblock %}
+
+{% block extra_scripts %}
+<!-- ECharts 图表库（K线图） -->
+<script src="https://cdn.jsdelivr.net/npm/echarts@5.4.3/dist/echarts.min.js"></script>
+<script>
+var isAnalyzing = false;
+// 存储每个阶段的大模型原始回复，key 为阶段中文名
+var _rawLlmResponses = {};
+
+function toggleCostPriceInput() {
+    // 仅当选择"已买入（持仓）"时显示成本价和持仓数量输入框
+    var select = document.getElementById('positionStatus');
+    var costInput = document.getElementById('costPrice');
+    var quantityInput = document.getElementById('positionQuantity');
+    var show = select.value === '已持仓';
+    costInput.style.display = show ? 'inline-block' : 'none';
+    quantityInput.style.display = show ? 'inline-block' : 'none';
+    if (!show) {
+        costInput.value = '';
+        quantityInput.value = '';
+    }
+}
+
+function startAnalysis(forceRefresh) {
+    if (isAnalyzing) return;
+    isAnalyzing = true;
+
+    var code = '{{ code }}';
+    var userInput = document.getElementById('userInput').value.trim();
+    var positionStatus = document.getElementById('positionStatus').value;
+    var costPrice = document.getElementById('costPrice').value;
+    var positionQuantity = document.getElementById('positionQuantity').value;
+    var startBtn = document.getElementById('startAnalyzeBtn');
+    var refreshBtn = document.getElementById('refreshAnalyzeBtn');
+    var loading = document.getElementById('loading');
+    var errorDiv = document.getElementById('error');
+
+    // 隐藏所有阶段结果区域
+    hideAllStages();
+    errorDiv.style.display = 'none';
+    errorDiv.textContent = '';
+    document.getElementById('logContainer').innerHTML = '';
+    document.getElementById('llmRecordsContainer').innerHTML = '';
+    document.getElementById('llmRecordsSection').style.display = 'none';
+
+    document.getElementById('progressSection').style.display = 'block';
+    loading.style.display = 'block';
+    startBtn.disabled = true;
+    refreshBtn.disabled = true;
+    startBtn.textContent = forceRefresh ? '强制刷新中...' : '分析中...';
+    refreshBtn.textContent = forceRefresh ? '刷新中...' : '等待中';
+
+    addLogEntry('系统', forceRefresh ? '强制刷新股票 ' + code + '（跳过缓存）' : '开始分析股票 ' + code);
+
+    // 使用 SSE 流式接口
+    fetch('/api/analyze-stream/' + code, {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({
+            user_input: userInput,
+            position_status: positionStatus,
+            cost_price: costPrice ? parseFloat(costPrice) : null,
+            position_quantity: positionQuantity ? parseFloat(positionQuantity) : null,
+            force_refresh: forceRefresh || false
+        })
+    })
+    .then(function(resp) {
+        if (!resp.ok) {
+            return resp.json().then(function(data) {
+                throw new Error(data.detail || '请求失败');
+            });
+        }
+
+        // 处理 SSE 流式响应
+        var reader = resp.body.getReader();
+        var decoder = new TextDecoder();
+        var buffer = '';
+
+        function processStream() {
+            return reader.read().then(function(result) {
+                if (result.done) {
+                    return;
+                }
+
+                buffer += decoder.decode(result.value, {stream: true});
+
+                // 解析 SSE 事件（格式：event: xxx\ndata: {...}\n\n）
+                var lines = buffer.split('\n');
+                buffer = '';
+                var eventType = '';
+                var eventData = '';
+
+                for (var i = 0; i < lines.length; i++) {
+                    var line = lines[i];
+
+                    if (line.startsWith('event: ')) {
+                        eventType = line.substring(7).trim();
+                    } else if (line.startsWith('data: ')) {
+                        eventData = line.substring(6);
+                    } else if (line === '' && eventType && eventData) {
+                        // 完整的事件
+                        try {
+                            var data = JSON.parse(eventData);
+                            handleStreamEvent(eventType, data);
+                        } catch (e) {
+                            console.error('解析事件数据失败:', e, eventData);
+                        }
+                        eventType = '';
+                        eventData = '';
+                    } else if (line !== '') {
+                        // 不完整的行，放回缓冲区
+                        buffer = line + '\n' + buffer;
+                    }
+                }
+
+                return processStream();
+            });
+        }
+
+        return processStream();
+    })
+    .catch(function(err) {
+        loading.style.display = 'none';
+        errorDiv.style.display = 'block';
+        errorDiv.textContent = '分析失败: ' + err.message;
+        addLogEntry('错误', '分析失败: ' + err.message, 'error');
+    })
+    .finally(function() {
+        isAnalyzing = false;
+        startBtn.disabled = false;
+        startBtn.textContent = '重新分析';
+        var refreshBtn = document.getElementById('refreshAnalyzeBtn');
+        if (refreshBtn) {
+            refreshBtn.disabled = false;
+            refreshBtn.textContent = '强制刷新';
+        }
+    });
+}
+
+// 处理流式事件
+function handleStreamEvent(eventType, data) {
+    var loading = document.getElementById('loading');
+    var errorDiv = document.getElementById('error');
+
+    switch (eventType) {
+        case 'phase':
+            // 阶段进度更新
+            addLogEntry('阶段', data.phase + ' - ' + data.status, 'info');
+            break;
+
+        case 'log':
+            // 日志事件
+            addLogEntry(data.stage, data.message, data.type);
+            break;
+
+        case 'llm_call':
+            // LLM 调用记录
+            renderLlmRecord(data);
+            // 按阶段存储大模型完整回复，供各阶段卡片展示
+            _rawLlmResponses[data.stage] = data.response;
+            break;
+
+        case 'data_collection':
+            // 数据采集结果（完整数据）
+            if (data && Object.keys(data).length > 0) {
+                renderDataCollection(data);
+            }
+            break;
+
+        case 'extended_analysis':
+            // 9维度扩展分析（完整数据）
+            if (data && Object.keys(data).length > 0) {
+                renderExtendedAnalysis(data);
+            }
+            break;
+
+        case 'perception':
+            // 感知分析结果（完整数据）
+            if (data) {
+                renderPerception(data);
+            }
+            break;
+
+        case 'modeling':
+            // 建模分析结果（完整数据）
+            if (data) {
+                renderModeling(data);
+            }
+            break;
+
+        case 'reasoning':
+            // 推理分析结果（完整数据）
+            if (data) {
+                renderReasoning(data);
+            }
+            break;
+
+        case 'decision':
+            // 决策结果（完整数据）
+            if (data) {
+                renderDecision(data);
+            }
+            break;
+
+        case 'report':
+            // 最终报告
+            loading.style.display = 'none';
+            var reportDiv = document.getElementById('report');
+            document.getElementById('reportCard').style.display = 'block';
+            reportDiv.innerHTML = markedToHtml(data.content);
+            addLogEntry('完成', '分析报告生成完毕', 'info');
+            break;
+
+        case 'error':
+            // 错误事件
+            loading.style.display = 'none';
+            errorDiv.style.display = 'block';
+            errorDiv.textContent = '分析失败: ' + data.message;
+            addLogEntry('错误', data.message, 'error');
+            break;
+
+        case 'complete':
+            // 完成事件
+            loading.style.display = 'none';
+            break;
+    }
+}
+
+// ======================== 阶段渲染函数 ========================
+
+function hideAllStages() {
+    var stages = ['stageDataCollection', 'stageExtendedAnalysis', 'stagePerception',
+                  'stageModeling', 'stageReasoning', 'stageDecision', 'reportCard'];
+    stages.forEach(function(id) {
+        var el = document.getElementById(id);
+        if (el) el.style.display = 'none';
+    });
+}
+
+function toggleStage(stageId) {
+    var body = document.getElementById('stage' + stageId.charAt(0).toUpperCase() + stageId.slice(1) + 'Body');
+    if (!body) return;
+    var icon = body.parentElement.querySelector('.toggle-icon');
+    if (body.style.display === 'none') {
+        body.style.display = 'block';
+        if (icon) icon.innerHTML = '&#9660;';
+    } else {
+        body.style.display = 'none';
+        if (icon) icon.innerHTML = '&#9654;';
+    }
+}
+
+// ---- 阶段0：数据采集 ----
+function renderDataCollection(dc) {
+    var html = '<div class="data-info-grid">';
+
+    if (dc.quote) {
+        var q = dc.quote;
+        var changeClass = (q.change_percent || 0) >= 0 ? 'color-green' : 'color-red';
+        var changeSign = (q.change_percent || 0) >= 0 ? '+' : '';
+        html += '<div class="info-card"><strong>' + escapeHtml(q.name || '') + '</strong>';
+        html += '<br>最新价: ' + (q.latest_price || 0).toFixed(2);
+        html += ' <span class="' + changeClass + '">' + changeSign + (q.change_percent || 0).toFixed(2) + '%</span>';
+        html += '<br>成交量: ' + formatNum(q.volume || 0) + '手';
+        html += '<br>换手率: ' + (q.turnover_rate || 0).toFixed(2) + '%';
+        html += '<br>振幅: ' + (q.amplitude || 0).toFixed(2) + '%';
+        if (q.pe_ttm != null) html += '<br>PE(TTM): ' + q.pe_ttm.toFixed(1);
+        if (q.pb != null) html += '<br>PB: ' + q.pb.toFixed(2);
+        if (q.market_cap != null) html += '<br>总市值: ' + formatMarketCap(q.market_cap);
+        html += '</div>';
+    }
+    html += '<div class="info-card">';
+    html += '<strong>数据来源:</strong> ' + escapeHtml(dc.source || '') + '<br>';
+    html += '<strong>采集时间:</strong> ' + escapeHtml(dc.fetched_at || '') + '<br>';
+    html += '<strong>K线数据:</strong> ' + (dc.klines_count || 0) + ' 条<br>';
+    html += '<strong>资金流数据:</strong> ' + (dc.capital_flow_count || 0) + ' 条<br>';
+    html += '<strong>新闻:</strong> ' + (dc.news_count || 0) + ' 条';
+    // 缓存状态标签
+    if (dc.extended_analysis_from_cache !== undefined) {
+        html += '<br><span class="cache-badge ' + (dc.extended_analysis_from_cache ? 'cache-hit' : 'cache-miss') + '">';
+        html += dc.extended_analysis_from_cache ? '扩展分析数据来自缓存' : '扩展分析数据实时拉取';
+        html += '</span>';
+    }
+    html += '</div>';
+    html += '</div>';
+
+    document.getElementById('dataCollectionContent').innerHTML = html;
+    document.getElementById('stageDataCollection').style.display = 'block';
+
+    // 渲染近20日K线图
+    var kl = dc.klines_recent;
+    if (kl && kl.length > 0) {
+        renderKlineChart(kl);
+    } else {
+        document.getElementById('klineChartContainer').style.display = 'none';
+    }
+}
+
+// ---- 近20日K线图（ECharts） ----
+function renderKlineChart(klines) {
+    var container = document.getElementById('klineChartContainer');
+    var chartDiv = document.getElementById('klineChart');
+    if (!container || !chartDiv) return;
+
+    container.style.display = 'block';
+
+    // 图表数据
+    var dates = [];
+    var klineData = [];
+    var volumeData = [];
+    var ma5Data = [];
+    var ma10Data = [];
+    var ma20Data = [];
+
+    for (var i = 0; i < klines.length; i++) {
+        var k = klines[i];
+        dates.push(k.date);
+        // ECharts candlestick 数据格式: [open, close, low, high]
+        klineData.push([k.open, k.close, k.low, k.high]);
+        volumeData.push({value: k.volume, itemStyle: {color: k.close >= k.open ? '#ef232a' : '#14b143'}});
+        ma5Data.push(k.ma5 != null ? k.ma5 : '-');
+        ma10Data.push(k.ma10 != null ? k.ma10 : '-');
+        ma20Data.push(k.ma20 != null ? k.ma20 : '-');
+    }
+
+    // 若 ECharts 未加载（CDN 不可用），提示并隐藏图表
+    if (typeof echarts === 'undefined') {
+        container.style.display = 'none';
+        return;
+    }
+
+    // 复用已有图表实例（重复分析时避免重复创建）
+    var chart = echarts.getInstanceByDom(chartDiv);
+    if (!chart) {
+        chart = echarts.init(chartDiv);
+        chart._resizeHandler = function() { chart.resize(); };
+        window.addEventListener('resize', chart._resizeHandler);
+    }
+    chart.setOption({
+        animation: false,
+        legend: {
+            top: 0,
+            data: ['K线', 'MA5', 'MA10', 'MA20']
+        },
+        tooltip: {
+            trigger: 'axis',
+            axisPointer: {type: 'cross'}
+        },
+        grid: [
+            {left: 60, right: 20, top: 30, height: '55%'},
+            {left: 60, right: 20, top: '72%', height: '18%'}
+        ],
+        xAxis: [
+            {type: 'category', data: dates, boundaryGap: true},
+            {type: 'category', gridIndex: 1, data: dates, boundaryGap: true}
+        ],
+        yAxis: [
+            {scale: true},
+            {gridIndex: 1, scale: true, axisLabel: {show: false}}
+        ],
+        dataZoom: [
+            {type: 'inside', xAxisIndex: [0, 1], start: 0, end: 100},
+            {type: 'slider', xAxisIndex: [0, 1], bottom: 0, height: 16}
+        ],
+        series: [
+            {
+                name: 'K线',
+                type: 'candlestick',
+                data: klineData,
+                itemStyle: {
+                    color: '#ef232a',          // 阳线（上涨）填充色
+                    color0: '#14b143',          // 阴线（下跌）填充色
+                    borderColor: '#ef232a',
+                    borderColor0: '#14b143'
+                }
+            },
+            {
+                name: 'MA5',
+                type: 'line',
+                data: ma5Data,
+                smooth: true,
+                showSymbol: false,
+                lineStyle: {width: 1, color: '#f59e0b'}
+            },
+            {
+                name: 'MA10',
+                type: 'line',
+                data: ma10Data,
+                smooth: true,
+                showSymbol: false,
+                lineStyle: {width: 1, color: '#3b82f6'}
+            },
+            {
+                name: 'MA20',
+                type: 'line',
+                data: ma20Data,
+                smooth: true,
+                showSymbol: false,
+                lineStyle: {width: 1, color: '#8b5cf6'}
+            },
+            {
+                name: '成交量',
+                type: 'bar',
+                xAxisIndex: 1,
+                yAxisIndex: 1,
+                data: volumeData
+            }
+        ]
+    });
+}
+
+// ---- 9维度扩展分析 ----
+function renderExtendedAnalysis(ea) {
+    var html = '';
+
+    // 缓存状态
+    if (ea.from_cache !== undefined) {
+        html += '<div style="margin-bottom:12px;">';
+        html += '<span class="cache-badge ' + (ea.from_cache ? 'cache-hit' : 'cache-miss') + '">';
+        html += ea.from_cache ? '数据来自缓存 (采集时间: ' + escapeHtml(ea.fetched_at || '') + ')' : '数据实时拉取';
+        html += '</span>';
+        html += '</div>';
+    }
+
+    // 1. 资金流向
+    html += '<div class="analysis-dim-item"><span class="dim-num">1</span>';
+    html += '<strong>资金流向：</strong>';
+    var flowLabel = {'inflow': '流入', 'outflow': '流出', 'balanced': '平衡', 'unknown': '暂无数据'};
+    var flowClass = {'inflow': 'color-green', 'outflow': 'color-red', 'balanced': 'color-yellow', 'unknown': ''};
+    html += '<span class="' + (flowClass[ea.capital_flow_direction] || '') + '">' + (flowLabel[ea.capital_flow_direction] || '未知') + '</span>';
+    html += '<br><span class="dim-detail">' + escapeHtml(ea.capital_flow_summary || '') + '</span></div>';
+
+    // 2. 基金资金
+    html += '<div class="analysis-dim-item"><span class="dim-num">2</span>';
+    html += '<strong>基金资金：</strong>';
+    var fundLabel = {'inflow': '流入（加仓）', 'outflow': '流出（减仓）', 'unchanged': '持平', 'unknown': '暂无数据'};
+    html += '<span class="' + (flowClass[ea.fund_capital_direction] || '') + '">' + (fundLabel[ea.fund_capital_direction] || '未知') + '</span>';
+    if (ea.fund_holding_count != null) html += ' | 持仓基金: ' + ea.fund_holding_count + '只';
+    if (ea.fund_holding_change != null) html += ' | 持股变化: ' + (ea.fund_holding_change > 0 ? '+' : '') + ea.fund_holding_change.toFixed(2) + '百分点';
+    html += '<br><span class="dim-detail">' + escapeHtml(ea.fund_analysis_summary || '') + '</span></div>';
+
+    // 3. 社保基金
+    html += '<div class="analysis-dim-item"><span class="dim-num">3</span>';
+    html += '<strong>社保基金：</strong>';
+    var secLabel = {'inflow': '持有中', 'outflow': '减仓', 'unchanged': '未变动', 'unknown': '暂无数据'};
+    html += '<span class="' + (flowClass[ea.social_security_direction] || '') + '">' + (secLabel[ea.social_security_direction] || '未知') + '</span>';
+    if (ea.social_security_holding != null) html += ' | 持股比例: ' + ea.social_security_holding.toFixed(2) + '%';
+    html += '<br><span class="dim-detail">' + escapeHtml(ea.social_security_analysis_summary || '') + '</span></div>';
+
+    // 4. 股东户数
+    html += '<div class="analysis-dim-item"><span class="dim-num">4</span>';
+    html += '<strong>股东户数：</strong>';
+    var shLabel = {'increase': '增加（筹码分散）', 'decrease': '减少（筹码集中）', 'unchanged': '基本持平', 'unknown': '暂无数据'};
+    var shClass = {'increase': 'color-red', 'decrease': 'color-green', 'unchanged': '', 'unknown': ''};
+    html += '<span class="' + (shClass[ea.shareholder_count_change] || '') + '">' + (shLabel[ea.shareholder_count_change] || '未知') + '</span>';
+    if (ea.shareholder_count_latest != null) html += ' | 最新: ' + formatNum(ea.shareholder_count_latest) + '户';
+    if (ea.shareholder_change_rate != null) html += ' | 变化: ' + (ea.shareholder_change_rate > 0 ? '+' : '') + ea.shareholder_change_rate.toFixed(1) + '%';
+    html += '<br><span class="dim-detail">' + escapeHtml(ea.shareholder_analysis_summary || '') + '</span></div>';
+
+    // 5. 平均持股
+    html += '<div class="analysis-dim-item"><span class="dim-num">5</span>';
+    html += '<strong>股东平均持股：</strong>';
+    var avgLabel = {'increase': '增加', 'decrease': '减少', 'unknown': '暂无数据'};
+    html += '<span class="' + (avgLabel[ea.avg_share_holding_change] === '增加' ? 'color-green' : (avgLabel[ea.avg_share_holding_change] === '减少' ? 'color-red' : '')) + '">' + (avgLabel[ea.avg_share_holding_change] || '未知') + '</span></div>';
+
+    // 6. 活跃股
+    html += '<div class="analysis-dim-item"><span class="dim-num">6</span>';
+    html += '<strong>活跃股：</strong>';
+    html += '<span class="' + (ea.is_active_stock ? 'color-green' : '') + '">' + (ea.is_active_stock ? '是' : '否') + '</span>';
+    if (ea.active_stock_score != null) html += ' | 活跃度评分: ' + ea.active_stock_score.toFixed(0) + '/100';
+    html += '<br><span class="dim-detail">' + escapeHtml(ea.active_stock_reason || '') + '</span></div>';
+
+    // 7. 热点题材
+    html += '<div class="analysis-dim-item"><span class="dim-num">7</span>';
+    html += '<strong>热点题材：</strong>';
+    if (ea.hot_themes && ea.hot_themes.length > 0) {
+        html += ea.hot_themes.map(function(t) { return '<span class="theme-tag">' + escapeHtml(t) + '</span>'; }).join(' ');
+    } else {
+        html += '暂无匹配题材';
+    }
+    html += '<br><span class="dim-detail">' + escapeHtml(ea.hot_theme_detail || '') + '</span></div>';
+
+    // 8. 潜在风险
+    html += '<div class="analysis-dim-item"><span class="dim-num">8</span>';
+    html += '<strong>潜在风险：</strong>';
+    var riskLabel = {'高': 'color-red', '中': 'color-yellow', '低': 'color-green'};
+    html += '风险等级: <span class="' + (riskLabel[ea.risk_level] || '') + '">' + (ea.risk_level || '未知') + '</span>';
+    html += '<br><span class="dim-detail">' + escapeHtml(ea.risk_analysis_summary || '') + '</span>';
+    if (ea.potential_risks && ea.potential_risks.length > 0) {
+        html += '<ul class="risk-list">';
+        ea.potential_risks.forEach(function(r) { html += '<li>' + escapeHtml(r) + '</li>'; });
+        html += '</ul>';
+    }
+    html += '</div>';
+
+    // 9. 投资价值
+    html += '<div class="analysis-dim-item"><span class="dim-num">9</span>';
+    html += '<strong>投资价值：</strong>';
+    if (ea.investment_value_score != null) {
+        var valColor = ea.investment_value_score >= 70 ? 'color-green' : (ea.investment_value_score >= 50 ? 'color-yellow' : 'color-red');
+        html += '<span class="score-badge ' + valColor + '">' + ea.investment_value_score.toFixed(0) + '分</span>';
+    }
+    html += ' <strong>' + escapeHtml(ea.investment_value || '') + '</strong>';
+    html += '<br><span class="dim-detail">' + escapeHtml(ea.investment_value_reason || '') + '</span></div>';
+
+    document.getElementById('extendedAnalysisContent').innerHTML = html;
+    document.getElementById('stageExtendedAnalysis').style.display = 'block';
+}
+
+// ---- 阶段1：感知分析 ----
+function renderPerception(perception) {
+    var html = '';
+    if (perception.key_observations && perception.key_observations.length > 0) {
+        html += '<h3>关键观察</h3><ul>';
+        perception.key_observations.forEach(function(o) { html += '<li>' + escapeHtml(o) + '</li>'; });
+        html += '</ul>';
+    }
+    if (perception.technical_signals && Object.keys(perception.technical_signals).length > 0) {
+        html += '<h3>技术信号</h3>';
+        html += renderKvTable(perception.technical_signals);
+    }
+    if (perception.fundamental_signals && Object.keys(perception.fundamental_signals).length > 0) {
+        html += '<h3>基本面信号</h3>';
+        html += renderKvTable(perception.fundamental_signals);
+    }
+    if (perception.capital_flow_signals && Object.keys(perception.capital_flow_signals).length > 0) {
+        html += '<h3>资金面信号</h3>';
+        html += renderKvTable(perception.capital_flow_signals);
+    }
+    if (perception.news_impact && perception.news_impact.length > 0) {
+        html += '<h3>新闻影响</h3><ul>';
+        perception.news_impact.forEach(function(n) { html += '<li>' + escapeHtml(n) + '</li>'; });
+        html += '</ul>';
+    }
+    if (!html) html = '<p>' + escapeHtml(JSON.stringify(perception)) + '</p>';
+    document.getElementById('perceptionContent').innerHTML = html;
+    document.getElementById('stagePerception').style.display = 'block';
+    renderStageLlmResponse('感知分析', 'perceptionContent');
+}
+
+// ---- 阶段2：建模分析 ----
+function renderModeling(model) {
+    var html = '';
+    if (model.market_state) html += '<p><strong>市场状态：</strong>' + escapeHtml(model.market_state) + '</p>';
+    if (model.trend_judgment) html += '<p><strong>趋势判断：</strong>' + escapeHtml(model.trend_judgment) + '</p>';
+    if (model.sentiment) html += '<p><strong>市场情绪：</strong>' + escapeHtml(model.sentiment) + '</p>';
+    if (model.risk_factors && model.risk_factors.length > 0) {
+        html += '<h4>风险因素</h4><ul>';
+        model.risk_factors.forEach(function(r) { html += '<li>' + escapeHtml(r) + '</li>'; });
+        html += '</ul>';
+    }
+    if (model.opportunity_factors && model.opportunity_factors.length > 0) {
+        html += '<h4>机会因素</h4><ul>';
+        model.opportunity_factors.forEach(function(o) { html += '<li>' + escapeHtml(o) + '</li>'; });
+        html += '</ul>';
+    }
+    if (!html) html = '<p>' + escapeHtml(JSON.stringify(model)) + '</p>';
+    document.getElementById('modelingContent').innerHTML = html;
+    document.getElementById('stageModeling').style.display = 'block';
+    renderStageLlmResponse('建模分析', 'modelingContent');
+}
+
+// ---- 阶段3：推理分析（3个方案对比） ----
+function renderReasoning(plans) {
+    var html = '';
+    if (!Array.isArray(plans)) { plans = [plans]; }
+    plans.forEach(function(plan, idx) {
+        html += '<div class="plan-card">';
+        html += '<h3>方案 ' + (idx + 1) + '：' + escapeHtml(plan.plan_id || 'N/A') + '</h3>';
+        if (plan.hypothesis) html += '<p><strong>假设：</strong>' + escapeHtml(plan.hypothesis) + '</p>';
+        if (plan.approach) html += '<p><strong>分析方法：</strong>' + escapeHtml(plan.approach) + '</p>';
+        if (plan.expected_outcome) html += '<p><strong>预期结果：</strong>' + escapeHtml(plan.expected_outcome) + '</p>';
+        if (plan.confidence != null) {
+            var confColor = plan.confidence >= 0.7 ? 'color-green' : (plan.confidence >= 0.4 ? 'color-yellow' : 'color-red');
+            html += '<p><strong>置信度：</strong><span class="' + confColor + '">' + (plan.confidence * 100).toFixed(0) + '%</span></p>';
+        }
+        if (plan.pros && plan.pros.length > 0) {
+            html += '<p><strong>优势：</strong></p><ul>';
+            plan.pros.forEach(function(p) { html += '<li>' + escapeHtml(p) + '</li>'; });
+            html += '</ul>';
+        }
+        if (plan.cons && plan.cons.length > 0) {
+            html += '<p><strong>劣势：</strong></p><ul>';
+            plan.cons.forEach(function(c) { html += '<li>' + escapeHtml(c) + '</li>'; });
+            html += '</ul>';
+        }
+        html += '</div>';
+    });
+    if (!html) html = '<p>' + escapeHtml(JSON.stringify(plans)) + '</p>';
+    document.getElementById('reasoningContent').innerHTML = html;
+    document.getElementById('stageReasoning').style.display = 'block';
+    renderStageLlmResponse('推理分析', 'reasoningContent');
+}
+
+// ---- 阶段4：决策结果 ----
+function renderDecision(decision) {
+    var html = '';
+    if (decision.selected_plan_id) html += '<p><strong>选中方案：</strong>' + escapeHtml(decision.selected_plan_id) + '</p>';
+    if (decision.investment_thesis) html += '<p><strong>投资论点：</strong>' + escapeHtml(decision.investment_thesis) + '</p>';
+    if (decision.recommendation) {
+        var recColor = {'买入': 'color-green', '持有': 'color-yellow', '卖出': 'color-red', '观望': ''};
+        html += '<p><strong>投资建议：</strong><span class="' + (recColor[decision.recommendation] || '') + '" style="font-size:1.2em;">' + escapeHtml(decision.recommendation) + '</span></p>';
+    }
+    if (decision.target_price_range) html += '<p><strong>目标价格区间：</strong>' + escapeHtml(decision.target_price_range) + '</p>';
+    if (decision.timeframe) html += '<p><strong>时间框架：</strong>' + escapeHtml(decision.timeframe) + '</p>';
+    if (decision.risk_assessment) html += '<p><strong>风险评估：</strong>' + escapeHtml(decision.risk_assessment) + '</p>';
+    if (decision.supporting_evidence && decision.supporting_evidence.length > 0) {
+        html += '<h4>支持证据</h4><ul>';
+        decision.supporting_evidence.forEach(function(e) { html += '<li>' + escapeHtml(e) + '</li>'; });
+        html += '</ul>';
+    }
+    if (!html) html = '<p>' + escapeHtml(JSON.stringify(decision)) + '</p>';
+    document.getElementById('decisionContent').innerHTML = html;
+    document.getElementById('stageDecision').style.display = 'block';
+    renderStageLlmResponse('决策分析', 'decisionContent');
+}
+
+// ---- 在阶段卡片内渲染大模型完整回复 ----
+function renderStageLlmResponse(stageKey, containerId) {
+    var response = _rawLlmResponses[stageKey];
+    if (!response) return;
+    var container = document.getElementById(containerId);
+    if (!container) return;
+    var div = document.createElement('div');
+    div.className = 'llm-response-section';
+    div.innerHTML = '<div class="llm-toggle" onclick="toggleRecord(this)">'
+        + '<span class="llm-arrow">&#9654;</span> 查看该阶段大模型的完整回复</div>'
+        + '<div class="llm-content" style="display:none;">'
+        + '<pre class="response-text">' + escapeHtml(response) + '</pre>'
+        + '</div>';
+    container.appendChild(div);
+}
+
+// ---- LLM 调用记录（单条） ----
+function renderLlmRecord(record) {
+    var section = document.getElementById('llmRecordsSection');
+    var container = document.getElementById('llmRecordsContainer');
+    section.style.display = 'block';
+    container.style.display = 'block';
+    document.getElementById('llmToggleIcon').innerHTML = '&#9660;';
+
+    var index = container.children.length;
+    var recordHtml = '<div class="llm-record">';
+    recordHtml += '<h4>调用 #' + (index + 1) + ': ' + record.stage + '</h4>';
+
+    recordHtml += '<div class="llm-toggle" onclick="toggleRecord(this)">';
+    recordHtml += '<span class="llm-arrow">&#9654;</span> 查看发送给大模型的提示词';
+    recordHtml += '</div>';
+    recordHtml += '<div class="llm-content" style="display:none;">';
+    recordHtml += '<div class="prompt-section">';
+    recordHtml += '<h5>System Prompt:</h5>';
+    recordHtml += '<pre class="prompt-text">' + escapeHtml(record.system_prompt) + '</pre>';
+    recordHtml += '</div>';
+    recordHtml += '<div class="prompt-section">';
+    recordHtml += '<h5>User Prompt:</h5>';
+    recordHtml += '<pre class="prompt-text">' + escapeHtml(record.user_prompt) + '</pre>';
+    recordHtml += '</div>';
+    recordHtml += '</div>';
+
+    recordHtml += '<div class="llm-toggle" onclick="toggleRecord(this)">';
+    recordHtml += '<span class="llm-arrow">&#9654;</span> 查看大模型的回复';
+    recordHtml += '</div>';
+    recordHtml += '<div class="llm-content" style="display:none;">';
+    recordHtml += '<pre class="response-text">' + escapeHtml(record.response) + '</pre>';
+    recordHtml += '</div>';
+
+    recordHtml += '</div>';
+    container.innerHTML += recordHtml;
+}
+
+// ---- LLM 调用记录（批量） ----
+function renderLlmRecords(records) {
+    var section = document.getElementById('llmRecordsSection');
+    var container = document.getElementById('llmRecordsContainer');
+    section.style.display = 'block';
+    records.forEach(function(record, index) {
+        var recordHtml = '<div class="llm-record">';
+        recordHtml += '<h4>调用 #' + (index + 1) + ': ' + record.stage + '</h4>';
+
+        recordHtml += '<div class="llm-toggle" onclick="toggleRecord(this)">';
+        recordHtml += '<span class="llm-arrow">&#9654;</span> 查看发送给大模型的提示词';
+        recordHtml += '</div>';
+        recordHtml += '<div class="llm-content" style="display:none;">';
+        recordHtml += '<div class="prompt-section">';
+        recordHtml += '<h5>System Prompt:</h5>';
+        recordHtml += '<pre class="prompt-text">' + escapeHtml(record.system_prompt) + '</pre>';
+        recordHtml += '</div>';
+        recordHtml += '<div class="prompt-section">';
+        recordHtml += '<h5>User Prompt:</h5>';
+        recordHtml += '<pre class="prompt-text">' + escapeHtml(record.user_prompt) + '</pre>';
+        recordHtml += '</div>';
+        recordHtml += '</div>';
+
+        recordHtml += '<div class="llm-toggle" onclick="toggleRecord(this)">';
+        recordHtml += '<span class="llm-arrow">&#9654;</span> 查看大模型的回复';
+        recordHtml += '</div>';
+        recordHtml += '<div class="llm-content" style="display:none;">';
+        recordHtml += '<pre class="response-text">' + escapeHtml(record.response) + '</pre>';
+        recordHtml += '</div>';
+
+        recordHtml += '</div>';
+        container.innerHTML += recordHtml;
+    });
+}
+
+// ======================== 工具函数 ========================
+
+function renderKvTable(obj) {
+    var html = '<table class="kv-table">';
+    Object.keys(obj).forEach(function(k) {
+        html += '<tr><td>' + escapeHtml(k) + '</td><td>' + escapeHtml(String(obj[k])) + '</td></tr>';
+    });
+    html += '</table>';
+    return html;
+}
+
+function formatNum(n) {
+    if (n >= 1e8) return (n / 1e8).toFixed(2) + '亿';
+    if (n >= 1e4) return (n / 1e4).toFixed(2) + '万';
+    return n.toLocaleString();
+}
+
+function formatMarketCap(v) {
+    if (!v) return 'N/A';
+    if (v >= 1e12) return (v / 1e12).toFixed(2) + '万亿';
+    if (v >= 1e8) return (v / 1e8).toFixed(2) + '亿';
+    return (v / 1e4).toFixed(2) + '万';
+}
+
+// ---- 以下为复用函数 ----
+
+function addLogEntry(stage, message, type) {
+    var container = document.getElementById('logContainer');
+    if (!container) return;
+    var entry = document.createElement('div');
+    entry.className = 'log-entry log-' + (type || 'info');
+    var stageSpan = document.createElement('span');
+    stageSpan.className = 'log-stage';
+    stageSpan.textContent = '[' + stage + ']';
+    entry.appendChild(stageSpan);
+    var msgSpan = document.createElement('span');
+    msgSpan.className = 'log-message';
+    msgSpan.textContent = message;
+    entry.appendChild(msgSpan);
+    container.appendChild(entry);
+    container.scrollTop = container.scrollHeight;
+}
+
+function toggleLlmRecords() {
+    var container = document.getElementById('llmRecordsContainer');
+    var icon = document.getElementById('llmToggleIcon');
+    if (container.style.display === 'none') {
+        container.style.display = 'block';
+        icon.innerHTML = '&#9660;';
+    } else {
+        container.style.display = 'none';
+        icon.innerHTML = '&#9654;';
+    }
+}
+
+function toggleRecord(el) {
+    var content = el.nextElementSibling;
+    var arrow = el.querySelector('.llm-arrow');
+    if (content && content.classList.contains('llm-content')) {
+        if (content.style.display === 'none') {
+            content.style.display = 'block';
+            arrow.innerHTML = '&#9660;';
+        } else {
+            content.style.display = 'none';
+            arrow.innerHTML = '&#9654;';
+        }
+    }
+}
+
+function escapeHtml(text) {
+    var div = document.createElement('div');
+    div.textContent = text;
+    return div.innerHTML;
+}
+
+function markedToHtml(text) {
+    if (!text) return '';
+    var html = text
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/### (.+)/g, '<h3>$1</h3>')
+        .replace(/## (.+)/g, '<h2>$1</h2>')
+        .replace(/# (.+)/g, '<h1>$1</h1>')
+        .replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>')
+        .replace(/\n\n/g, '</p><p>')
+        .replace(/\n/g, '<br>');
+    return '<p>' + html + '</p>';
+}
+</script>
+{% endblock %}

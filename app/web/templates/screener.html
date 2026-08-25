@@ -1,0 +1,95 @@
+{% extends "base.html" %}
+{% block title %}选股 - 智能股票分析助手{% endblock %}
+
+{% block content %}
+<h1>智能选股</h1>
+
+<div class="card-grid">
+    <div class="card">
+        <h2>预设策略</h2>
+        <p>选择内置策略快速筛选</p>
+        <div class="strategy-list">
+            {% for key, name in strategies.items() %}
+            <button class="btn" onclick="applyStrategy('{{ key }}')">
+                {{ name }}
+            </button>
+            {% endfor %}
+        </div>
+    </div>
+
+    <div class="card">
+        <h2>自定义条件</h2>
+        <p>自由组合筛选条件（功能开发中）</p>
+        <button class="btn" onclick="window.location.href='/'">返回首页</button>
+    </div>
+</div>
+
+<div class="card">
+    <h2>你的投资偏好（可选）</h2>
+    <p>输入你的投资偏好，选股结果将更贴合你的需求。</p>
+    <div class="user-input-box">
+        <textarea id="userOpinion" rows="3" placeholder="例如：我偏好低估值蓝筹股，希望筛选PE低、股息率高的股票..."></textarea>
+    </div>
+</div>
+
+<div id="results" class="card" style="display:none;">
+    <h2>筛选结果</h2>
+    <div id="resultsContent"></div>
+</div>
+{% endblock %}
+
+{% block extra_scripts %}
+<script>
+document.addEventListener('DOMContentLoaded', function() {
+    var params = new URLSearchParams(window.location.search);
+    var intent = params.get('intent');
+    if (intent) {
+        document.getElementById('userOpinion').value = decodeURIComponent(intent);
+    }
+});
+
+async function applyStrategy(name) {
+    var userOpinion = document.getElementById('userOpinion').value.trim();
+    var resultsDiv = document.getElementById('results');
+    var resultsContent = document.getElementById('resultsContent');
+    resultsDiv.style.display = 'block';
+    resultsContent.innerHTML = '<p>正在执行选股...</p>';
+
+    try {
+        var resp = await fetch('/api/screen', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({
+                strategy: name,
+                top_n: 30,
+                user_input: userOpinion
+            })
+        });
+        var data = await resp.json();
+        // 构建"当前筛选条件"展示区块（v2.6.0）
+        var conditionsHtml = '';
+        if (data.conditions && data.conditions.length > 0) {
+            var chips = data.conditions.map(function(c) {
+                return '<span class="cond-chip">' + c.display + '</span>';
+            }).join('');
+            conditionsHtml = '<div class="screen-conditions">' +
+                '<p class="cond-title">当前筛选条件<span class="cond-source">' + (data.source_label || '筛选条件') + '</span></p>' +
+                '<div class="cond-chips">' + chips + '</div></div>';
+        }
+        if (data.results && data.results.length > 0) {
+            var html = conditionsHtml + '<ul>';
+            data.results.forEach(function(r) {
+                html += '<li><a href="/?analyze=' + r.code + '">' + r.name + ' (' + r.code + ')</a></li>';
+            });
+            html += '</ul>';
+            resultsContent.innerHTML = html;
+        } else {
+            var opinionNote = data.user_input ? '（你的投资偏好已记录: ' + data.user_input + '）' : '';
+            resultsContent.innerHTML = conditionsHtml + '<p>暂无结果（全市场扫描功能开发中）。' + opinionNote + '</p>';
+        }
+    } catch (err) {
+        resultsContent.innerHTML = '<p>请求失败: ' + err.message + '</p>';
+    }
+}
+</script>
+{% endblock %}

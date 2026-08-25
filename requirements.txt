@@ -1,0 +1,21 @@
+fastapi
+uvicorn[standard]
+jinja2
+python-multipart
+pydantic>=2
+openai
+langgraph
+pandas
+numpy
+akshare
+requests
+pytest
+pytest-asyncio
+httpx
+pyyaml
+python-dotenv
+# MCP 客户端 SDK + 第一层 A股 MCP Server（akshare-stock-mcp）
+# 第二层 mcp-eastmoney 未发布 PyPI，从 GitHub 源码安装（默认启用）
+mcp
+akshare-stock-mcp
+mcp-eastmoney @ https://github.com/27dream/mcp-eastmoney/archive/refs/heads/main.tar.gz
