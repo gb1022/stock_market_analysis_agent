@@ -15,13 +15,19 @@ class FieldCondition(BaseModel):
         ..., description="操作符"
     )
     value: float | list[float] = Field(..., description="值")
+    required: bool = Field(True, description="是否硬条件（必须满足，软条件仅作加分）")
 
 
-# 字段白名单（仅包含 AKShare 实时行情可提供的字段）
-# 财务指标（roe/revenue_growth/eps/bvps等）和技术指标（rsi_14/MA等）待后续版本支持
+# 字段白名单
+# 实时行情字段（阶段一粗筛可用）：
+#   pe_ttm / pb / turnover_rate / market_cap / change_percent / volume / amount / amplitude
+# 财务字段（阶段二精排，经 china-stock-mcp 拉取）：roe / revenue_growth / gross_margin
+# 技术字段（阶段二精排，经 stock-sdk-mcp K 线指标拉取）：rsi24 / ma20
 FIELD_WHITELIST = {
     "pe_ttm", "pb", "turnover_rate", "market_cap",
     "change_percent", "volume", "amount", "amplitude",
+    "roe", "revenue_growth", "gross_margin",
+    "rsi24", "ma20",
 }
 
 # 操作符白名单

@@ -9,14 +9,13 @@ from app.screener.conditions import ConditionGroup, FieldCondition
 def value_strategy() -> ConditionGroup:
     """价值选股策略。
 
-    PE 0~20 + PB 0~3 + 总市值 > 50亿 + 换手率 > 0.3%
-    （ROE/营收增长需财报数据，暂用市值和换手率替代作为价值筛选）
+    PE 0~20 + PB 0~3（阶段一粗筛硬条件） + ROE > 12%（阶段二精排硬条件）
+    ROE 为财务字段，粗筛阶段实时行情缺失时自然跳过，精排阶段用真实 ROE 过滤。
     """
     return (ConditionGroup()
         .add(FieldCondition(field="pe_ttm", op="between", value=[0, 20]))
         .add(FieldCondition(field="pb", op="between", value=[0, 3]))
-        .add(FieldCondition(field="market_cap", op=">", value=5e9))
-        .add(FieldCondition(field="turnover_rate", op=">", value=0.3))
+        .add(FieldCondition(field="roe", op=">", value=12))
     )
 
 
@@ -35,13 +34,13 @@ def momentum_strategy() -> ConditionGroup:
 def oversold_rebound_strategy() -> ConditionGroup:
     """超跌反弹策略。
 
-    涨跌幅 -8%~-0.5% + 振幅 > 4% + 换手率 > 0.5%
-    （RSI(14) 需 K 线计算，暂用近期跌幅和振幅替代）
+    涨跌幅 -8%~-0.5% + 换手率 > 0.5%（阶段一粗筛） + RSI24 < 30（阶段二精排）
+    RSI24 为技术字段，粗筛阶段实时行情缺失时自然跳过，精排阶段用真实 RSI 过滤。
     """
     return (ConditionGroup()
         .add(FieldCondition(field="change_percent", op="between", value=[-8, -0.5]))
-        .add(FieldCondition(field="amplitude", op=">", value=4))
         .add(FieldCondition(field="turnover_rate", op=">", value=0.5))
+        .add(FieldCondition(field="rsi24", op="<", value=30))
     )
 
 

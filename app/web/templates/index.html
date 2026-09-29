@@ -882,6 +882,29 @@ function buildConditionsHtml(data) {
         '<div class="cond-chips">' + chips + '</div></div>';
 }
 
+// 构建单只股票关键数据行（v2.12.0）：罗列全部可得行情字段，缺失项显示 --
+function buildStockDataHtml(r) {
+    var items = [];
+    // 命中率（v2.12.1）：评分列改显综合评分后，命中率移到数据行展示
+    items.push('命中 ' + r.matched_conditions + '/' + r.total_conditions);
+    // 涨跌幅（带颜色）
+    if (r.change_percent !== null && r.change_percent !== undefined) {
+        var cpColor = r.change_percent >= 0 ? '#ef4444' : '#22c55e';
+        items.push('<span style="color:' + cpColor + '">涨跌 ' + r.change_percent.toFixed(2) + '%</span>');
+    } else {
+        items.push('涨跌 --');
+    }
+    items.push('PE ' + (r.pe_ttm !== null && r.pe_ttm !== undefined ? r.pe_ttm.toFixed(1) : '--'));
+    items.push('PB ' + (r.pb !== null && r.pb !== undefined ? r.pb.toFixed(2) : '--'));
+    items.push('换手 ' + (r.turnover_rate !== null && r.turnover_rate !== undefined ? r.turnover_rate.toFixed(2) + '%' : '--'));
+    // 市值转为亿
+    items.push('市值 ' + (r.market_cap !== null && r.market_cap !== undefined ? (r.market_cap / 1e8).toFixed(0) + '亿' : '--'));
+    // 成交额转为亿
+    items.push('成交 ' + (r.amount !== null && r.amount !== undefined ? (r.amount / 1e8).toFixed(1) + '亿' : '--'));
+    items.push('振幅 ' + (r.amplitude !== null && r.amplitude !== undefined ? r.amplitude.toFixed(2) + '%' : '--'));
+    return items.join(' | ');
+}
+
 async function startScreening(userInput) {
     isProcessing = true;
     setInputEnabled(false);
@@ -892,6 +915,9 @@ async function startScreening(userInput) {
     addSystemMessage('<p><strong>开始智能选股...</strong> 使用策略: ' +
         ({'value': '价值选股', 'momentum': '动量选股', 'oversold_rebound': '超跌反弹'}[strategy] || strategy) + '</p>');
 
+    // 选股 + LLM 意见生成耗时较长，先给出加载提示（v2.12.0）
+    var loadingMsgId = addSystemMessage('<p class="screen-loading">正在筛选股票并生成选择意见，请稍候...</p>');
+
     try {
         var resp = await fetch('/api/screen', {
             method: 'POST',
@@ -899,6 +925,10 @@ async function startScreening(userInput) {
             body: JSON.stringify({user_input: userInput, strategy: strategy, top_n: 30})
         });
         var data = await resp.json();
+        // 请求完成，移除加载提示（v2.12.0）
+        if (loadingMsgId && loadingMsgId.parentNode) {
+            loadingMsgId.parentNode.removeChild(loadingMsgId);
+        }
         if (resp.ok && data.results && data.results.length > 0) {
             // 渲染选股结果列表
             var html = '<p><strong>选股完成</strong><span class="msg-time">[' + getTimestamp() + ']</span> - 共 ' + data.total + ' 只股票符合条件</p>';
@@ -907,13 +937,18 @@ async function startScreening(userInput) {
             html += '<table class="screen-table"><thead><tr><th>代码</th><th>名称</th><th>评分</th><th>选择意见</th><th>操作</th></tr></thead><tbody>';
             for (var i = 0; i < data.results.length; i++) {
                 var r = data.results[i];
-                var scorePct = Math.round(r.score * 100);
-                var scoreColor = scorePct >= 100 ? '#22c55e' : scorePct >= 67 ? '#f59e0b' : '#ef4444';
+                // 评分列优先显示 LLM 综合评分（v2.14.0），缺失时降级显示规则综合评分 final_score（v2.12.1）
+                var scorePct = Math.round(r.llm_score != null ? r.llm_score : r.final_score);
+                var scoreColor = scorePct >= 80 ? '#22c55e' : scorePct >= 60 ? '#f59e0b' : '#ef4444';
                 html += '<tr>';
                 html += '<td>' + escapeHtml(r.code) + '</td>';
                 html += '<td>' + escapeHtml(r.name) + '</td>';
                 html += '<td><span style="color:' + scoreColor + ';font-weight:600;">' + scorePct + '</span></td>';
-                html += '<td style="font-size:0.82rem;color:#555;max-width:280px;white-space:normal;">' + escapeHtml(r.reason || '') + '</td>';
+                // 选择意见列（v2.12.0）：上行关键数据 + 下行 LLM 意见
+                html += '<td class="opinion-cell">';
+                html += '<div class="opinion-data">' + buildStockDataHtml(r) + '</div>';
+                html += '<div class="opinion-text">' + (r.opinion ? escapeHtml(r.opinion) : escapeHtml(r.reason || '')) + '</div>';
+                html += '</td>';
                 html += '<td><button class="analyze-btn" onclick="quickAnalyze(\'' + escapeHtml(r.code) + '\', \'' + escapeHtml(r.name) + '\')">分析</button></td>';
                 html += '</tr>';
             }
@@ -930,6 +965,10 @@ async function startScreening(userInput) {
             currentState = STATE.idle;
         }
     } catch (err) {
+        // 异常时也移除加载提示（v2.12.0）
+        if (loadingMsgId && loadingMsgId.parentNode) {
+            loadingMsgId.parentNode.removeChild(loadingMsgId);
+        }
         addError('选股请求失败: ' + err.message);
         currentState = STATE.idle;
     }
@@ -1136,7 +1175,6 @@ function loadCachedStocks() {
 }
 
 function renderStockCard(s) {
-    var flowLabels = {'inflow': '资金流入', 'outflow': '资金流出', 'balanced': '资金平衡'};
     var html = '<div class="cached-stock-item" onclick="quickCachedAnalyze(\'' + escapeHtml(s.code) + '\')" title="点击分析此股票">';
     html += '<div class="stock-row1">';
     html += '  <span class="cached-stock-code">' + escapeHtml(s.code) + '</span>';
@@ -1149,21 +1187,32 @@ function renderStockCard(s) {
         var vc = s.investment_value_score >= 70 ? 'score-high' : (s.investment_value_score >= 50 ? 'score-mid' : 'score-low');
         html += '  <span class="cached-stock-badge ' + vc + '">' + s.investment_value_score + '分</span>';
     }
-    if (s.capital_flow_direction) {
-        var fc = s.capital_flow_direction === 'inflow' ? 'flow-in' : 'flow-out';
-        html += '  <span class="cached-stock-badge ' + fc + '">' + escapeHtml(flowLabels[s.capital_flow_direction] || s.capital_flow_direction) + '</span>';
-    }
     if (s.risk_level) {
         var rc = s.risk_level === '低' ? 'risk-low' : (s.risk_level === '中' ? 'risk-mid' : 'risk-high');
         html += '  <span class="cached-stock-badge ' + rc + '">风险' + escapeHtml(s.risk_level) + '</span>';
     }
-    if (s.is_active_stock) {
-        html += '  <span class="cached-stock-badge active">活跃股</span>';
-    }
-    if (s.investment_value) {
-        html += '  <span class="cached-stock-badge active">' + escapeHtml(s.investment_value) + '</span>';
+    if (s.recommendation) {
+        var recClass = {'买入': 'rec-buy', '持有': 'rec-hold', '卖出': 'rec-sell', '观望': 'rec-wait'}[s.recommendation] || 'rec-wait';
+        html += '  <span class="cached-stock-badge ' + recClass + '">建议' + escapeHtml(s.recommendation) + '</span>';
     }
     html += '</div>';
+    // 投资建议区（未买入/已持仓两场景，v2.10.0）
+    var notHolding = s.not_holding_advice;
+    var holding = s.holding_advice;
+    if (!notHolding && !holding) {
+        html += '<div class="advice-section advice-empty">暂无建议，重新分析后展示</div>';
+    } else {
+        html += '<div class="advice-section">';
+        if (notHolding) {
+            var notParts = [notHolding.recommendation, notHolding.entry_price_range, notHolding.position_suggestion].filter(Boolean);
+            html += '<div class="advice-block"><span class="advice-label">未买入</span>' + escapeHtml(notParts.join('，') || '暂无') + '</div>';
+        }
+        if (holding) {
+            var holdParts = [holding.recommendation, holding.stop_loss_price, holding.take_profit_price].filter(Boolean);
+            html += '<div class="advice-block"><span class="advice-label">已持仓</span>' + escapeHtml(holdParts.join('，') || '暂无') + '</div>';
+        }
+        html += '</div>';
+    }
     html += '<div class="cached-stock-meta">采集于 ' + escapeHtml((s.fetched_at || '').substring(0, 16)) + '</div>';
     html += '</div>';
     return html;

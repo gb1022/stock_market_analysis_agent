@@ -152,12 +152,18 @@ async def analysis_page(code: str, request: Request):
 # ---- API 路由 ----
 
 @router.post("/api/screen")
-async def api_screen(req: ScreenRequest):
+async def api_screen(req: ScreenRequest, request: Request):
     """选股 API。
 
     条件构建优先级（v2.6.0）：
       自定义条件(conditions) > 用户提示词抽取的条件 > 预设策略(strategy) > 默认条件
     用户提示词优先，抽取不到相关条件时才降级使用默认条件。
+
+    筛选执行（v2.13.0）：
+      三阶段筛选——阶段一用实时行情字段全市场粗筛得候选池（coarse_pool_size），
+      阶段二经 DataSourceRouter 拉取财务/技术指标对候选池精排，输出配额为
+      用户要求数量 × 3（上限 50），阶段三调用 LLM 从精排候选池中按用户要求
+      精选最终推荐股票并生成建议。
     """
     logger.info(f"[选股] 开始执行, strategy={req.strategy}, top_n={req.top_n}, user_input={req.user_input[:100] if req.user_input else ''}")
     try:
@@ -212,12 +218,40 @@ async def api_screen(req: ScreenRequest):
         if conditions is None:
             raise HTTPException(status_code=400, detail="请提供选股条件或选择预设策略")
 
-        # 执行全市场扫描；推荐数量优先级：提示词数量 > 请求参数 > 默认 30
+        # 执行两阶段筛选（v2.9.0）；推荐数量优先级：提示词数量 > 请求参数 > 默认 30
+        from app.config import load_config
         from app.screener.engine import ScreenerEngine
-        engine = ScreenerEngine(max_workers=10)
+        screener_cfg = load_config().get("screener", {})
+        coarse_pool_size = int(screener_cfg.get("coarse_pool_size", 100))
+        max_workers = int(screener_cfg.get("max_workers", 10))
         effective_top_n = prompt_top_n or req.top_n or 30
-        results = engine.scan(conditions, top_n=effective_top_n)
-        logger.info(f"[选股] 执行完成, 返回 {len(results)} 只股票, top_n={effective_top_n}")
+
+        engine = ScreenerEngine(max_workers=max_workers)
+        # 阶段一：实时行情全市场粗筛，得到候选池
+        coarse_results = engine.scan(conditions, top_n=coarse_pool_size)
+        # 阶段二：经 DataSourceRouter 拉取财务/技术指标后精排（无精排字段时原样截断）
+        # v2.13.0：阶段二输出配额 = 用户要求数量 × 3，上限 50，为阶段三精选提供挑选空间
+        from app.screener.final_select import compute_rank_pool_size, llm_final_select
+        rank_pool_size = compute_rank_pool_size(effective_top_n)
+        router = get_data_source_router(request)
+        rank_pool = engine.rank_candidates(coarse_results, conditions, router, top_n=rank_pool_size)
+        logger.info(f"[选股] 执行完成, 粗筛 {len(coarse_results)} 只候选, 精排返回 {len(rank_pool)} 只, 配额={rank_pool_size}")
+
+        # 阶段三：LLM 精选推荐（v2.13.0）：从精排候选池中按用户要求精选最终推荐并生成建议
+        # 替代 v2.12.0 的 opinion.py 意见生成；失败时兜底取前 effective_top_n 只，不阻塞返回
+        results = rank_pool
+        if rank_pool:
+            import asyncio
+            from app.llm.factory import create_llm_provider
+            try:
+                llm_provider = create_llm_provider()
+                results = await asyncio.to_thread(
+                    llm_final_select, rank_pool, llm_provider,
+                    effective_top_n, req.user_input,
+                )
+            except Exception as e:
+                logger.warning(f"[选股] 阶段三 LLM 精选失败，降级返回精排前 {effective_top_n} 只: {e}")
+                results = rank_pool[:effective_top_n]
 
         return {
             "results": [r.model_dump() for r in results],
@@ -322,7 +356,11 @@ async def api_analyze_stream(code: str, req: AnalyzeRequest = None, request: Req
                         # 构造与 _save_analysis_summary 兼容的结果结构
                         result = {
                             "extended_analysis": ea_data,
-                            "state": {"stock_name": ""},
+                            "state": {
+                                "stock_name": "",
+                                # 决策结果（含两场景投资建议），随摘要一并缓存
+                                "selected_plan": event['data'].get("selected_plan"),
+                            },
                             "data_collection": {},
                         }
                         _save_analysis_summary(cache, code, result, max_count)
@@ -506,6 +544,10 @@ async def api_cached_stocks(request: Request):
                     "capital_flow_direction": data.get("capital_flow_direction", ""),
                     "is_active_stock": data.get("is_active_stock", False),
                     "hot_themes": data.get("hot_themes", []),
+                    # 投资建议（v2.10.0）：整体建议 + 未买入/已持仓两场景建议
+                    "recommendation": data.get("recommendation", ""),
+                    "not_holding_advice": data.get("not_holding_advice"),
+                    "holding_advice": data.get("holding_advice"),
                 })
             except Exception:
                 results.append({"code": stock_code, "name": stock_name, "fetched_at": fetched_at})
@@ -540,6 +582,9 @@ def _save_analysis_summary(cache, code: str, result: dict, max_count: int = 50) 
     if not stock_name and dc:
         stock_name = dc.get("quote", {}).get("name", "")
 
+    # 提取决策阶段的投资建议（整体建议 + 未买入/已持仓两场景建议，v2.10.0）
+    selected_plan = state.get("selected_plan") or {}
+
     summary = {
         "stock_code": code,
         "stock_name": stock_name,
@@ -562,6 +607,10 @@ def _save_analysis_summary(cache, code: str, result: dict, max_count: int = 50) 
         "hot_themes": ea.get("hot_themes", []),
         "potential_risks": ea.get("potential_risks", []),
         "user_input": state.get("user_input", ""),
+        # 投资建议（v2.10.0）：整体建议 + 未买入/已持仓两场景建议
+        "recommendation": selected_plan.get("recommendation", ""),
+        "not_holding_advice": selected_plan.get("not_holding_advice"),
+        "holding_advice": selected_plan.get("holding_advice"),
     }
 
     cache.set_analysis_summary(code, summary, max_count=max_count)

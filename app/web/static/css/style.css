@@ -999,6 +999,32 @@ body > main.container {
     border-bottom: none;
 }
 
+/* ===== 选择意见列（v2.12.0）：上行关键数据 + 下行 LLM 意见 ===== */
+.screen-table td.opinion-cell {
+    white-space: normal;
+    max-width: 340px;
+    min-width: 260px;
+}
+
+.opinion-cell .opinion-data {
+    font-size: 0.72rem;
+    color: #888;
+    line-height: 1.5;
+    margin-bottom: 3px;
+}
+
+.opinion-cell .opinion-text {
+    font-size: 0.82rem;
+    color: #333;
+    line-height: 1.5;
+}
+
+/* 选股加载提示（v2.12.0） */
+.screen-loading {
+    color: #888;
+    font-size: 0.85rem;
+}
+
 .analyze-btn {
     background: #1a1a2e;
     color: #fff;
@@ -1320,6 +1346,46 @@ body > main.container {
 
 .cached-stock-action {
     display: none;
+}
+
+/* 投资建议徽章（v2.10.0） */
+.cached-stock-badge.rec-buy { background: #e8f5e9; color: #2e7d32; }
+.cached-stock-badge.rec-hold { background: #e3f2fd; color: #1565c0; }
+.cached-stock-badge.rec-sell { background: #fce4ec; color: #c62828; }
+.cached-stock-badge.rec-wait { background: #f5f5f5; color: #757575; }
+
+/* 投资建议区（未买入/已持仓两场景，v2.10.0） */
+.advice-section {
+    display: flex;
+    flex-direction: column;
+    gap: 3px;
+    margin-top: 2px;
+    padding: 6px 8px;
+    background: #f8f9fb;
+    border-radius: 6px;
+    font-size: 0.72rem;
+    color: #555;
+    line-height: 1.5;
+}
+
+.advice-section.advice-empty {
+    color: #aaa;
+}
+
+.advice-block {
+    display: flex;
+    align-items: flex-start;
+    gap: 6px;
+}
+
+.advice-label {
+    flex: none;
+    padding: 0 5px;
+    border-radius: 4px;
+    background: #e8eaf6;
+    color: #3949ab;
+    font-weight: 500;
+    line-height: 1.6;
 }
 
 /* ===== 通用按钮 ===== */

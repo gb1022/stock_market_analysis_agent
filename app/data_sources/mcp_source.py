@@ -128,8 +128,8 @@ class MCPClient:
             },
         )
         self._timeout = timeout
-        self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._thread: Optional[threading.Thread] = None
+        self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._session: Optional[ClientSession] = None
         self._shutdown_event: Optional[asyncio.Event] = None
         self._process: Optional[Any] = None

@@ -10,13 +10,15 @@ class TestWebRoutes:
     def client(self):
         """使用 TestClient。
 
-        ASGITransport 不触发 lifespan，需手动预置 app.state.cache，
-        否则 get_cache() 访问 request.app.state.cache 会抛 AttributeError。
+        ASGITransport 不触发 lifespan，需手动预置 app.state.cache 与 app.state.router，
+        否则 get_cache()/get_data_source_router() 访问 request.app.state 会抛 AttributeError。
         """
         from app.main import app
         from httpx import ASGITransport, AsyncClient
         if not hasattr(app.state, "cache"):
             app.state.cache = None
+        if not hasattr(app.state, "router"):
+            app.state.router = None
         transport = ASGITransport(app=app)
         return AsyncClient(transport=transport, base_url="http://test")
 
@@ -149,7 +151,7 @@ class TestWebRoutes:
         data = resp.json()
         assert data["condition_source"] == "strategy"
         assert data["source_label"] == "预设策略（价值选股）"
-        assert len(data["conditions"]) == 4  # 价值策略 4 个条件
+        assert len(data["conditions"]) == 3  # 价值策略 3 个条件（PE/PB/ROE）
 
     @pytest.mark.asyncio
     async def test_screen_api_user_input_fallback_default(self, client):
@@ -166,7 +168,7 @@ class TestWebRoutes:
         data = resp.json()
         assert data["condition_source"] == "default"
         assert data["source_label"] == "默认条件"
-        assert len(data["conditions"]) == 4  # 默认价值策略 4 个条件
+        assert len(data["conditions"]) == 3  # 默认价值策略 3 个条件（PE/PB/ROE）
 
     @pytest.mark.asyncio
     async def test_screen_api_user_input_top_n_preferred(self, client):
@@ -175,7 +177,8 @@ class TestWebRoutes:
 
         from app.screener.conditions import FieldCondition
 
-        with patch("app.screener.engine.ScreenerEngine.scan", return_value=[]) as mock_scan, \
+        with patch("app.screener.engine.ScreenerEngine.scan", return_value=[]), \
+             patch("app.screener.engine.ScreenerEngine.rank_candidates", return_value=[]) as mock_rank, \
              patch("app.web.routes.extract_screen_params", return_value=([
                  FieldCondition(field="pe_ttm", op="<", value=20),
              ], 10)):
@@ -186,10 +189,11 @@ class TestWebRoutes:
         assert resp.status_code == 200
         data = resp.json()
         assert data["condition_source"] == "prompt_extracted"
-        # 引擎扫描时应使用提示词指定的数量 10
-        call_kwargs = mock_scan.call_args
+        # 精排阶段配额应基于提示词指定的数量 10 计算（v2.13.0：10 × 3 = 30）
+        # 若误用请求参数 top_n=30，配额将是 50，故断言 30 可验证提示词数量优先生效
+        call_kwargs = mock_rank.call_args
         assert call_kwargs is not None
-        assert call_kwargs.kwargs.get("top_n") == 10
+        assert call_kwargs.kwargs.get("top_n") == 30
 
     @pytest.mark.asyncio
     async def test_screen_api_strategy_returns_conditions(self, client):
@@ -223,6 +227,28 @@ class TestWebRoutes:
         assert data["source_label"] == "自定义条件"
         assert len(data["conditions"]) == 1
         assert data["conditions"][0]["display"] == "PE < 20"
+
+    @pytest.mark.asyncio
+    async def test_screen_api_two_stage_ranking(self, client):
+        """正常路径（v2.13.0）：阶段一粗筛候选池 + 阶段二精排配额（要求数 × 3，上限 50）。"""
+        from unittest.mock import patch
+
+        from app.screener.conditions import FieldCondition
+
+        with patch("app.screener.engine.ScreenerEngine.scan", return_value=[]) as mock_scan, \
+             patch("app.screener.engine.ScreenerEngine.rank_candidates", return_value=[]) as mock_rank, \
+             patch("app.web.routes.extract_screen_params", return_value=([
+                 FieldCondition(field="roe", op=">", value=12),
+             ], None)):
+            resp = await client.post("/api/screen", json={
+                "user_input": "ROE大于12的股票",
+                "top_n": 30,
+            })
+        assert resp.status_code == 200
+        # 阶段一粗筛使用候选池数量（coarse_pool_size）
+        assert mock_scan.call_args.kwargs.get("top_n") == 100
+        # 阶段二精排配额 = 用户要求数量 × 3，上限 50（v2.13.0：30 × 3 = 90 → 封顶 50）
+        assert mock_rank.call_args.kwargs.get("top_n") == 50
 
     # ========== v2.6.2 聊天页选股透传原始输入测试 ==========
 
@@ -308,3 +334,56 @@ class TestSidebarScrollDisplay:
         assert "style.display = 'block'" not in body
         # 空数据/正常/加载失败三个分支均使用 flex
         assert body.count("style.display = 'flex'") == 3
+
+
+class TestScoreColumnUsesFinalScore:
+    """v2.12.1 评分列改为显示多因子综合评分（方案 A）。
+
+    背景：评分列原显示条件命中率（r.score*100），排序第一优先级为命中率，
+    导致推荐结果评分列全是 100，无区分度。改为显示多因子综合评分
+    final_score（0~100），命中率移到选择意见的数据行展示。
+    """
+
+    @pytest.fixture
+    def index_html(self):
+        """读取首页模板内容。"""
+        import os
+        path = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+            "app", "web", "templates", "index.html",
+        )
+        with open(path, encoding="utf-8") as f:
+            return f.read()
+
+    @staticmethod
+    def _slice_function(html, name):
+        """截取指定 JS 函数体（到下一个顶层函数声明为止）。"""
+        import re
+        marker = "function " + name
+        start = html.index(marker)
+        nxt = re.search(r"\n(?:async )?function ", html[start + len(marker):])
+        end = start + len(marker) + nxt.start() if nxt else len(html)
+        return html[start:end]
+
+    def test_score_column_uses_final_score(self, index_html):
+        """正常路径：评分列使用 final_score（综合评分），不再用命中率*100。"""
+        body = self._slice_function(index_html, "startScreening")
+        # 评分列应基于 final_score
+        assert "final_score" in body
+        # 不应再用命中率 r.score * 100 作为评分列
+        assert "Math.round(r.score * 100)" not in body
+
+    def test_match_rate_moved_to_data_row(self, index_html):
+        """正常路径：命中率（命中条件数/总条件数）移到选择意见的数据行。"""
+        body = self._slice_function(index_html, "buildStockDataHtml")
+        # 数据行应包含命中率信息（matched_conditions / total_conditions）
+        assert "matched_conditions" in body
+        assert "total_conditions" in body
+
+    def test_score_column_prefers_llm_score(self, index_html):
+        """v2.14.0 正常路径：评分列优先显示 llm_score（LLM 评分），缺失时降级 final_score。"""
+        body = self._slice_function(index_html, "startScreening")
+        # 评分列应优先基于 llm_score
+        assert "llm_score" in body
+        # 降级逻辑：llm_score 为空时回退到 final_score
+        assert "final_score" in body

@@ -213,6 +213,7 @@ def analyze_single_stock_stream(code: str, market: str = "A",
     last_llm_count = 0
     final_state = None
     extended_analysis = None
+    selected_plan = None
 
     # 发送启动事件
     yield {"type": "phase", "data": {"phase": "data_collection", "status": "started"}}
@@ -268,6 +269,8 @@ def analyze_single_stock_stream(code: str, market: str = "A",
                 elif node_name == "decision" and state.get("selected_plan"):
                     # 决策结果
                     yield {"type": "decision", "data": state["selected_plan"]}
+                    # 记录决策结果（含两场景投资建议），供 complete 事件使用
+                    selected_plan = state["selected_plan"]
 
                 # 记录下一个阶段的开始
                 next_phase = state.get("current_phase")
@@ -288,8 +291,12 @@ def analyze_single_stock_stream(code: str, market: str = "A",
         logger.error(f"[流式分析] 异常: {e}", exc_info=True)
         yield {"type": "error", "data": {"message": str(e)}}
         extended_analysis = None
+        selected_plan = None
 
-    yield {"type": "complete", "data": {"extended_analysis": extended_analysis}}
+    yield {"type": "complete", "data": {
+        "extended_analysis": extended_analysis,
+        "selected_plan": selected_plan,
+    }}
 
 
 def _summarize_perception(data: dict) -> str:

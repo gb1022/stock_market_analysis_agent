@@ -7,11 +7,19 @@ import logging
 from datetime import datetime
 from typing import Optional
 
+from app.config import load_config
 from app.screener.conditions import ConditionGroup
+from app.screener.scoring import score_stock
 from app.models.screener import ScreenResult
 from app.storage.cache import StockCache
 
 logger = logging.getLogger("stock_agent")
+
+# 涨停判定阈值（v2.11.0）：涨跌幅达到对应阈值视为涨停，粗筛时过滤。
+# 主板/中小板涨跌停幅度 10%，创业板(300/301)/科创板(688) 为 20%；
+# 阈值略低于整数（9.8/19.8）以容忍行情数据的四舍五入误差。
+_LIMIT_UP_THRESHOLD_MAIN = 9.8
+_LIMIT_UP_THRESHOLD_GEM_STAR = 19.8
 
 # AKShare spot 列名 → 引擎内部字段名映射
 _SPOT_FIELD_MAP = {
@@ -40,6 +48,11 @@ _FIELD_DISPLAY: dict[str, tuple[str, str, str]] = {
 # 市值显示阈值
 _MARKET_CAP_DIVISOR = 1e8  # 转为亿
 
+# 阶段二精排字段分组（v2.9.0）：
+# 财务字段经 DataSourceRouter.get_financial 拉取；技术字段经 get_kline 拉取
+_FINANCIAL_RANK_FIELDS = {"roe", "revenue_growth", "gross_margin"}
+_TECHNICAL_RANK_FIELDS = {"rsi24", "ma20"}
+
 
 class ScreenerEngine:
     """选股引擎。
@@ -56,6 +69,43 @@ class ScreenerEngine:
     def __init__(self, max_workers: int = 10) -> None:
         self._max_workers = max_workers
         self._data_cache = None  # 实例级缓存，单次 scan() 内部不重复拉取
+        # 涨停过滤开关（v2.11.0）：可配置，默认开启；配置读取失败时兜底开启
+        self.limit_up_filter_enabled = self._load_limit_up_filter_enabled()
+
+    @staticmethod
+    def _load_limit_up_filter_enabled() -> bool:
+        """从配置读取涨停过滤开关，缺省或读取失败时默认开启。
+
+        配置路径：screener.limit_up_filter.enabled（config/default.yaml）。
+        """
+        try:
+            screener_cfg = load_config().get("screener", {})
+            filter_cfg = screener_cfg.get("limit_up_filter", {})
+            return bool(filter_cfg.get("enabled", True))
+        except Exception as e:
+            logger.warning(f"[选股引擎] 涨停过滤配置读取失败，默认开启: {e}")
+            return True
+
+    @staticmethod
+    def _is_limit_up(code: str, change_percent: Optional[float]) -> bool:
+        """判断股票是否涨停（v2.11.0）。
+
+        按板块阈值判定：创业板(300/301 开头)/科创板(688 开头) 阈值 19.8%，
+        其余（主板/中小板）阈值 9.8%。涨跌幅缺失时不视为涨停。
+
+        Args:
+            code: 6 位股票代码
+            change_percent: 涨跌幅（百分数）
+
+        Returns:
+            是否涨停
+        """
+        if change_percent is None:
+            return False
+        code = str(code or "")
+        if code.startswith(("300", "301", "688")):
+            return change_percent >= _LIMIT_UP_THRESHOLD_GEM_STAR
+        return change_percent >= _LIMIT_UP_THRESHOLD_MAIN
 
     def scan(self, conditions: ConditionGroup,
              top_n: int = 30) -> list[ScreenResult]:
@@ -82,6 +132,9 @@ class ScreenerEngine:
         if not stock_data:
             logger.error("[选股引擎] 所有数据源均失败，无法执行选股")
             return []
+
+        # 按 code 排序，消除不同数据源返回顺序差异，保证结果可复现
+        stock_data.sort(key=lambda x: x.get("code", ""))
 
         # 执行筛选
         results = self.scan_with_data(conditions, stock_data, top_n)
@@ -511,6 +564,9 @@ class ScreenerEngine:
                        top_n: int = 30) -> list[ScreenResult]:
         """使用已有数据执行扫描（用于测试和 Mock）。
 
+        支持部分匹配：命中部分条件的股票也入选，score 按命中率计算。
+        支持硬/软条件：硬条件（required=True）必须满足，软条件仅作加分。
+
         Args:
             conditions: 筛选条件组
             stock_data: 股票数据列表
@@ -520,68 +576,239 @@ class ScreenerEngine:
             符合条件的股票列表
         """
         results: list[ScreenResult] = []
+        total = len(conditions.conditions)
+
+        # 计算全市场各因子的分位数边界，供多因子评分归一化使用
+        market_stats = self._compute_market_stats(stock_data)
 
         for data in stock_data:
+            # 涨停过滤（v2.11.0）：开关开启时排除已涨停股票，
+            # 避免非交易时段快照（上一交易日数据）导致推荐结果被涨停股霸榜
+            if self.limit_up_filter_enabled and self._is_limit_up(
+                    data.get("code", ""), data.get("change_percent")):
+                continue
+
             matched = 0
-            total = len(conditions.conditions)
+            hard_failed = False
             reason_parts: list[str] = []
 
             for cond in conditions.conditions:
-                field = cond.field
-                op = cond.op
-                value = cond.value
-                actual = data.get(field)
-
+                actual = data.get(cond.field)
                 if actual is None:
                     continue
 
-                is_match = False
-                if op == ">":
-                    is_match = actual > value
-                elif op == "<":
-                    is_match = actual < value
-                elif op == ">=":
-                    is_match = actual >= value
-                elif op == "<=":
-                    is_match = actual <= value
-                elif op == "==":
-                    is_match = actual == value
-                elif op == "between" and isinstance(value, list):
-                    is_match = value[0] <= actual <= value[1]
-
-                if is_match:
+                if self._matches(cond.op, actual, cond.value):
                     matched += 1
-                    # 生成字段说明
-                    display_info = _FIELD_DISPLAY.get(field)
-                    if display_info:
-                        display_name, unit, tag = display_info
-                        # 市值特殊处理：转为亿
-                        if field == "market_cap":
-                            display_val = f"{actual / _MARKET_CAP_DIVISOR:.0f}"
-                        elif unit:
-                            display_val = f"{actual:.1f}"
-                        else:
-                            display_val = f"{actual:.1f}"
-                        reason_parts.append(f"{display_name} {display_val}{unit}({tag})")
-                    else:
-                        reason_parts.append(f"{field}={actual}")
+                    reason_parts.append(self._format_reason(cond.field, actual))
+                elif cond.required:
+                    hard_failed = True
 
-            if total > 0 and matched == total:
-                score = matched / total
-                reason_text = " + ".join(reason_parts) if reason_parts else f"命中 {matched}/{total} 个条件"
-                results.append(ScreenResult(
-                    code=data.get("code", ""),
-                    name=data.get("name", ""),
-                    score=score,
-                    matched_conditions=matched,
-                    total_conditions=total,
-                    reason=reason_text,
-                    analyzed_at=datetime.now(),
-                ))
+            # 硬条件未满足则排除
+            if hard_failed:
+                continue
+            # 零命中过滤
+            if matched == 0:
+                continue
 
-        # 按匹配度排序
-        results.sort(key=lambda r: (-r.score, -r.matched_conditions))
+            score = matched / total if total > 0 else 0.0
+            reason_text = " + ".join(reason_parts) if reason_parts else f"命中 {matched}/{total} 个条件"
+
+            # 多因子综合评分（v2.8.0）：条件契合度 + 估值 + 动量 + 活跃度 + 规模
+            factor_data = {
+                "condition_fit": score,
+                "pe_ttm": self._safe_float(data.get("pe_ttm")),
+                "pb": self._safe_float(data.get("pb")),
+                "change_percent": self._safe_float(data.get("change_percent")),
+                "turnover_rate": self._safe_float(data.get("turnover_rate")),
+                "market_cap": self._safe_float(data.get("market_cap")),
+            }
+            final_score, factor_detail = score_stock(factor_data, market_stats)
+
+            results.append(ScreenResult(
+                code=data.get("code", ""),
+                name=data.get("name", ""),
+                score=score,
+                matched_conditions=matched,
+                total_conditions=total,
+                reason=reason_text,
+                is_partial=matched < total,
+                change_percent=factor_data["change_percent"],
+                amount=self._safe_float(data.get("amount")),
+                final_score=final_score,
+                factor_detail=factor_detail,
+                # 关键行情字段透传（v2.12.0）：供前端展示与 LLM 意见生成
+                pe_ttm=self._safe_float(data.get("pe_ttm")),
+                pb=self._safe_float(data.get("pb")),
+                turnover_rate=self._safe_float(data.get("turnover_rate")),
+                market_cap=self._safe_float(data.get("market_cap")),
+                volume=self._safe_float(data.get("volume")),
+                amplitude=self._safe_float(data.get("amplitude")),
+                analyzed_at=datetime.now(),
+            ))
+
+        # 稳定排序：命中率降序 → 命中数降序 → 多因子评分降序 → 成交额降序（v2.11.0）
+        # 兜底键由涨跌幅绝对值改为成交额：涨跌幅绝对值会让涨停股霸榜
+        # （非交易时段快照为上一交易日数据，涨停股绝对值最大）
+        results.sort(key=lambda r: (
+            -r.score,
+            -r.matched_conditions,
+            -(r.final_score if r.final_score is not None else 0.0),
+            -(r.amount if r.amount is not None else 0.0),
+        ))
         return results[:top_n]
+
+    def rank_candidates(self, candidates: list[ScreenResult],
+                        conditions: ConditionGroup,
+                        router,
+                        top_n: int = 30) -> list[ScreenResult]:
+        """阶段二精排：对粗筛候选池拉取财务/技术指标后按精排字段过滤。
+
+        粗筛阶段实时行情缺失的新字段（roe/rsi24 等）在此处才参与匹配。
+        单一字段白名单自动分阶段：仅当条件中包含财务/技术精排字段时才拉取 MCP，
+        否则原样返回候选（不产生额外拉取）。
+
+        Args:
+            candidates: 阶段一粗筛返回的候选结果
+            conditions: 完整条件组（含粗筛 + 精排字段）
+            router: DataSourceRouter 实例（拉取财务与 K 线）
+            top_n: 精排后返回的股票数量上限
+
+        Returns:
+            精排后满足硬条件的候选列表（数据缺失时降级保留）
+        """
+        # 识别本次条件涉及的精排字段
+        financial_fields = set()
+        technical_fields = set()
+        for cond in conditions.conditions:
+            if cond.field in _FINANCIAL_RANK_FIELDS:
+                financial_fields.add(cond.field)
+            elif cond.field in _TECHNICAL_RANK_FIELDS:
+                technical_fields.add(cond.field)
+
+        # 无条件涉及精排字段时，无需拉取 MCP，原样返回
+        if not financial_fields and not technical_fields:
+            return list(candidates[:top_n])
+
+        kept: list[ScreenResult] = []
+        for cand in candidates:
+            code = cand.code
+            fin_values: dict = {}
+            tech_values: dict = {}
+
+            # 拉取财务数据（失败降级保留，不阻塞精排）
+            if financial_fields:
+                fin_data = None
+                try:
+                    fin_data = router.get_financial(code)
+                except Exception as e:
+                    logger.warning(f"[选股引擎] 精排拉取财务数据失败 {code}: {e}")
+                if fin_data is not None:
+                    for field in financial_fields:
+                        fin_values[field] = getattr(fin_data, field, None)
+
+            # 拉取 K 线技术指标（失败降级保留，不阻塞精排）
+            if technical_fields:
+                klines = None
+                try:
+                    klines = router.get_kline(code)
+                except Exception as e:
+                    logger.warning(f"[选股引擎] 精排拉取K线失败 {code}: {e}")
+                if klines:
+                    latest = klines[-1]
+                    for field in technical_fields:
+                        tech_values[field] = getattr(latest, field, None)
+
+            merged = {**fin_values, **tech_values}
+
+            # 逐条校验精排硬条件：不满足则剔除，数据缺失则降级保留
+            hard_failed = False
+            for cond in conditions.conditions:
+                if cond.field not in financial_fields and cond.field not in technical_fields:
+                    continue
+                actual = merged.get(cond.field)
+                if actual is None:
+                    continue
+                if not self._matches(cond.op, actual, cond.value):
+                    if cond.required:
+                        hard_failed = True
+                        break
+
+            if not hard_failed:
+                kept.append(cand)
+
+        return kept[:top_n]
+
+    @staticmethod
+    def _compute_market_stats(stock_data: list[dict]) -> dict:
+        """从全市场数据计算各因子的分位数边界 [p_low, p_high]（min/max）。
+
+        因子字段：pe_ttm、pb、change_percent、turnover_rate、market_cap。
+        有效值不足两个时返回默认范围，避免 p_high <= p_low 导致全部取中性分。
+
+        Args:
+            stock_data: 全市场股票数据列表
+
+        Returns:
+            各因子分位数边界 dict
+        """
+        fields = ["pe_ttm", "pb", "change_percent", "turnover_rate", "market_cap"]
+        stats: dict = {}
+        for field in fields:
+            values = [d.get(field) for d in stock_data if d.get(field) is not None]
+            if len(values) >= 2:
+                stats[field] = {"p_low": min(values), "p_high": max(values)}
+            else:
+                stats[field] = {"p_low": 0.0, "p_high": 1.0}
+        return stats
+
+    @staticmethod
+    def _matches(op: str, actual: float, value) -> bool:
+        """判断单个字段是否满足操作符条件。
+
+        Args:
+            op: 操作符
+            actual: 实际值
+            value: 条件值
+
+        Returns:
+            是否满足
+        """
+        if op == ">":
+            return actual > value
+        if op == "<":
+            return actual < value
+        if op == ">=":
+            return actual >= value
+        if op == "<=":
+            return actual <= value
+        if op == "==":
+            return actual == value
+        if op == "between" and isinstance(value, list):
+            return value[0] <= actual <= value[1]
+        return False
+
+    @staticmethod
+    def _format_reason(field: str, actual: float) -> str:
+        """生成字段的可读说明。
+
+        Args:
+            field: 字段名
+            actual: 实际值
+
+        Returns:
+            可读说明文本
+        """
+        display_info = _FIELD_DISPLAY.get(field)
+        if display_info:
+            display_name, unit, tag = display_info
+            if field == "market_cap":
+                display_val = f"{actual / _MARKET_CAP_DIVISOR:.0f}"
+            elif unit:
+                display_val = f"{actual:.1f}"
+            else:
+                display_val = f"{actual:.1f}"
+            return f"{display_name} {display_val}{unit}({tag})"
+        return f"{field}={actual}"
 
     @staticmethod
     def _safe_float(value) -> Optional[float]:

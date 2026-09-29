@@ -101,13 +101,13 @@ class TestExtractConditions:
         assert conditions == []
 
     def test_extract_empty_on_invalid_field(self):
-        """边界：字段不在白名单时忽略（如 roe 不支持）。"""
+        """边界：字段不在白名单时忽略（如 pe_forward 不支持）。"""
         provider = FakeLLMProvider('''
         {"conditions": [
-            {"field": "roe", "op": ">", "value": 15}
+            {"field": "pe_forward", "op": ">", "value": 15}
         ]}
         ''')
-        conditions = extract_conditions("ROE大于15的股票", provider=provider)
+        conditions = extract_conditions("预测市盈率大于15的股票", provider=provider)
         assert conditions == []
 
     def test_extract_llm_failure(self):
@@ -178,7 +178,7 @@ class TestToFieldCondition:
 
     def test_invalid_field(self):
         """边界：字段不在白名单返回 None。"""
-        assert _to_field_condition({"field": "roe", "op": ">", "value": 15}) is None
+        assert _to_field_condition({"field": "pe_forward", "op": ">", "value": 15}) is None
 
     def test_invalid_op(self):
         """边界：操作符不合法返回 None。"""
@@ -321,3 +321,51 @@ class TestExtractScreenParams:
         provider = FakeLLMProvider('{"conditions": [], "top_n": 10.8}')
         _, top_n = extract_screen_params("推荐十只左右的股票", provider=provider)
         assert top_n == 10
+
+
+class TestFinancialTechnicalFields:
+    """财务/技术字段抽取与格式化测试（新增于 2026-08-25, v2.9.0）"""
+
+    def test_extract_roe_condition(self):
+        """正常路径：ROE 条件可抽取。"""
+        provider = FakeLLMProvider('''
+        {"conditions": [{"field": "roe", "op": ">", "value": 15}]}
+        ''')
+        conditions = extract_conditions("ROE大于15的股票", provider=provider)
+        assert len(conditions) == 1
+        assert conditions[0].field == "roe"
+        assert conditions[0].op == ">"
+        assert conditions[0].value == 15.0
+
+    def test_extract_rsi24_condition(self):
+        """正常路径：RSI24 条件可抽取。"""
+        provider = FakeLLMProvider('''
+        {"conditions": [{"field": "rsi24", "op": "<", "value": 30}]}
+        ''')
+        conditions = extract_conditions("RSI低于30的超跌股", provider=provider)
+        assert len(conditions) == 1
+        assert conditions[0].field == "rsi24"
+        assert conditions[0].value == 30.0
+
+    def test_extract_ma20_condition(self):
+        """正常路径：MA20 技术指标条件可抽取。"""
+        provider = FakeLLMProvider('''
+        {"conditions": [{"field": "ma20", "op": ">", "value": 10}]}
+        ''')
+        conditions = extract_conditions("站上20日均线的股票", provider=provider)
+        assert len(conditions) == 1
+        assert conditions[0].field == "ma20"
+
+    def test_normalize_roe_no_conversion(self):
+        """正常路径：ROE 百分比字段无需单位换算。"""
+        assert _normalize_value("roe", 15) == 15.0
+
+    def test_format_roe_percent(self):
+        """正常路径：ROE 显示带 % 单位。"""
+        cond = FieldCondition(field="roe", op=">", value=15)
+        assert format_condition(cond) == "ROE > 15%"
+
+    def test_format_rsi24(self):
+        """正常路径：RSI24 显示无单位。"""
+        cond = FieldCondition(field="rsi24", op="<", value=30)
+        assert format_condition(cond) == "RSI24 < 30"
